@@ -36,6 +36,7 @@
 #include "ide_cdrom.h"
 #include "support/minimig/akiko_cd32.h"
 #include "support/minimig/cdtv_cd.h"
+#include "support/xu/xu.h"
 #ifdef PROFILING
 #include "profiling.h"
 #endif
@@ -1415,6 +1416,11 @@ void user_io_init(const char *path, const char *xml)
 	// Stop the A2065 threads left over from a previous core. The Minimig boot
 	// path below restarts them if the card is enabled.
 	a2065_stop();
+
+	// Same idea for XU: stop it on any core switch. Unlike A2065, XU has no
+	// dedicated boot-path start call -- xu_poll() (below) restarts itself
+	// once it sees the PDP2011 core loaded and enabled.
+	xu_stop();
 
 	// we need to set the directory to where the XML file (MRA) is
 	// not the RBF. The RBF will be in arcade, which the user shouldn't
@@ -3210,6 +3216,14 @@ void user_io_poll()
 		minimig_share_poll();
 		a2065_poll();
 	}
+
+	// Unlike A2065 (Minimig-only), XU is an ordinary CORE_TYPE_8BIT core
+	// with no dedicated boot-path hook -- xu_poll() checks the loaded core
+	// name and its own OSD status bit internally on every call, so it must
+	// run unconditionally here (outside the is_minimig() block above),
+	// alongside every other 8BIT/SHARPMZ core this function already
+	// services per the function's own top-level gate.
+	xu_poll();
 
 	if (core_type == CORE_TYPE_8BIT && !is_menu())
 	{
