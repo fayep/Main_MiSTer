@@ -296,7 +296,9 @@ static int xu_rx_enqueue(const uint8_t *buf, uint32_t framelen, uint64_t erxtail
 	rx_wrpos = next_ptr;
 	erxhead_count++;
 	wr64(XU_ERXHEAD_OFF, erxhead_count);
-	xu_log("[xu] RX frame %u: %u bytes, erxhead=%u\n", erxhead_count, framelen, erxhead_count);
+	xu_log("[xu] RX frame %u: %u bytes, erxhead=%u, start=0x%04x next_ptr=0x%04x hdr=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+		erxhead_count, framelen, erxhead_count, start, next_ptr,
+		hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7]);
 	return 1;
 }
 
