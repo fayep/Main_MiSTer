@@ -76,6 +76,31 @@ static uint32_t rx_wrpos = XU_BUF_RX_OFF; /* real byte position within the RX ri
 static uint8_t g_mac[6];                /* published MAC, cached for xu_poll_rx()'s
                                           * unicast-vs-broadcast classification */
 
+/* Two real, persistent priority queues -- not per-call staging. See
+ * xu_poll_rx() for the full rationale. Declared here (before xu_start())
+ * so xu_start() can reset them on card-up. */
+#define XU_RXQ_DEPTH 100         /* backlog buffer, not ring capacity -- frames
+                                   * beyond this are simply dropped (xu_rxq_push) */
+struct xu_rx_pending { uint8_t buf[XU_MAX_FRAME]; uint32_t len; };
+struct xu_rxq { struct xu_rx_pending item[XU_RXQ_DEPTH]; int head, tail, count; };
+static struct xu_rxq rxq_uni, rxq_other;
+
+static int xu_rxq_push(struct xu_rxq *q, const uint8_t *buf, uint32_t len)
+{
+	if (q->count >= XU_RXQ_DEPTH) return 0;  /* backlog buffer itself full -- drop */
+	struct xu_rx_pending *p = &q->item[q->tail];
+	memcpy(p->buf, buf, len);
+	p->len = len;
+	q->tail = (q->tail + 1) % XU_RXQ_DEPTH;
+	q->count++;
+	return 1;
+}
+
+static void xu_rxq_reset(struct xu_rxq *q)
+{
+	q->head = q->tail = q->count = 0;
+}
+
 static inline uint64_t rd64(uint32_t off)
 {
 	return *(volatile uint64_t*)(map + off);
@@ -157,6 +182,8 @@ static void xu_start(void)
 	wr64(XU_ERXHEAD_OFF, 0);
 	wr64(XU_TXRTS_DONE_OFF, 0);
 	tx_pending = 0;
+	xu_rxq_reset(&rxq_uni);
+	xu_rxq_reset(&rxq_other);
 
 	card_up = 1;
 	xu_log("[xu] started on %s\n", XU_IFACE);
@@ -273,20 +300,27 @@ static int xu_rx_enqueue(const uint8_t *buf, uint32_t framelen, uint64_t erxtail
 	return 1;
 }
 
-/* Software prefilter + unicast-priority staging for one poll's worth of
- * frames. The kernel BPF filter (ethernet_set_mac_filter, shared with
- * A2065 -- see xu_poll_rx()'s own comment) only narrows to dst==our MAC
- * or broadcast/multicast; it can't reorder, and tightening it further
- * isn't an option since it's shared, reused (not copied) infrastructure
- * that the Amiga core also depends on. Both the ethertype tightening and
- * the unicast-first delivery order live entirely here instead, matching
- * this project's standing preference for new components at a clean
- * boundary over touching shared/upstream code. */
-struct xu_rx_pending { uint8_t buf[XU_MAX_FRAME]; uint32_t len; };
-static struct xu_rx_pending rx_unicast[XU_RX_BATCH_MAX];
-static struct xu_rx_pending rx_other[XU_RX_BATCH_MAX];
-
-/* RX: only once RXEN is set -- matches real hardware (a real ENC424J600
+/* xu_poll_rx() below drains the one shared socket into two real,
+ * persistent priority queues (rxq_uni/rxq_other, declared earlier
+ * alongside g_mac) -- not per-call staging. They carry a backlog across
+ * xu_poll() calls: a frame that doesn't fit into the DDR3 ring this pass
+ * (because it's still full -- firmware hasn't drained it yet) stays
+ * queued and is retried next poll, rather than being read out of the
+ * kernel socket and then dropped if it lost the intake-pass race. The
+ * kernel BPF filter (ethernet_set_mac_filter, shared with A2065) only
+ * narrows to dst==our MAC or broadcast/multicast; it can't reorder or
+ * persist a backlog, and tightening it further isn't an option since
+ * it's shared, reused (not copied) infrastructure the Amiga core also
+ * depends on. Both the ethertype tightening and the unicast-first
+ * priority live entirely here instead, matching this project's standing
+ * preference for new components at a clean boundary over touching
+ * shared/upstream code.
+ *
+ * XU_RXQ_DEPTH is deliberately much bigger than the DDR3 ring can ever
+ * hold at once (real, observed backlogs of 100+ frames on a busy LAN) --
+ * it's a software backlog buffer, not a mirror of ring capacity.
+ *
+ * RX: only once RXEN is set -- matches real hardware (a real ENC424J600
  * doesn't receive until RXEN is enabled either), and firmware's own real
  * init order always sets ERXTAIL before enabling RXEN, so this also
  * guarantees ERXTAIL is validly initialized (not its all-zero reset
@@ -295,20 +329,18 @@ static void xu_poll_rx(void)
 {
 	if (!(rd64(XU_RXEN_OFF) & 1)) return;
 
-	uint64_t erxtail = rd64(XU_ERXTAIL_OFF);
 	uint8_t buf[XU_MAX_FRAME];
-	int n_unicast = 0, n_other = 0;
 
-	/* Pass 1: drain up to XU_RX_BATCH_MAX frames total (same bounded-
-	 * work discipline as before -- Main is single-threaded), dropping
-	 * anything that isn't ARP or IP right here (this old guest speaks
-	 * nothing else -- no IPv6/STP/mDNS/etc use on this LAN segment is
-	 * ever relevant), and classifying what's left as unicast-to-us vs.
-	 * broadcast/multicast for the priority pass below. */
+	/* Intake: read whatever's waiting on the one shared socket, up to a
+	 * bounded per-call budget (same discipline as before -- Main is
+	 * single-threaded), dropping anything that isn't ARP or IP right
+	 * here (this old guest speaks nothing else), and pushing what's
+	 * left onto its own persistent queue by classification. This step
+	 * never touches DDR3 and never blocks on ring space. */
 	for (int i = 0; i < XU_RX_BATCH_MAX; i++)
 	{
 		int n = ethernet_recv_nb(buf, sizeof buf);
-		if (n <= 0) break;  /* 0 = queue drained, <0 = error -- stop this pass either way */
+		if (n <= 0) break;  /* 0 = socket drained, <0 = error -- stop this pass either way */
 		if (n < 14) continue;  /* shorter than a full Ethernet header -- can't classify, drop */
 
 		uint16_t ethertype = ((uint16_t)buf[12] << 8) | buf[13];
@@ -316,31 +348,34 @@ static void xu_poll_rx(void)
 			continue;
 
 		int is_unicast_to_us = (memcmp(buf, g_mac, 6) == 0);
-		if (is_unicast_to_us && n_unicast < XU_RX_BATCH_MAX)
-		{
-			memcpy(rx_unicast[n_unicast].buf, buf, n);
-			rx_unicast[n_unicast].len = (uint32_t)n;
-			n_unicast++;
-		}
-		else if (!is_unicast_to_us && n_other < XU_RX_BATCH_MAX)
-		{
-			memcpy(rx_other[n_other].buf, buf, n);
-			rx_other[n_other].len = (uint32_t)n;
-			n_other++;
-		}
+		if (!xu_rxq_push(is_unicast_to_us ? &rxq_uni : &rxq_other, buf, (uint32_t)n))
+			xu_log("[xu] RX backlog full (%s), dropping frame\n", is_unicast_to_us ? "unicast" : "other");
 	}
 
-	/* Pass 2: enqueue unicast-to-us frames first, so a reply meant
-	 * specifically for us can never be starved out of ring space by a
-	 * flood of broadcast/multicast traffic from other hosts on a busy
-	 * segment (real, observed problem: a busy LAN's broadcast ARP noise
-	 * from unrelated hosts was arriving fast enough to plausibly crowd
-	 * out the one reply we actually needed). Broadcast/multicast frames
-	 * fill whatever ring space is left after that. */
-	for (int i = 0; i < n_unicast; i++)
-		xu_rx_enqueue(rx_unicast[i].buf, rx_unicast[i].len, erxtail);
-	for (int i = 0; i < n_other; i++)
-		xu_rx_enqueue(rx_other[i].buf, rx_other[i].len, erxtail);
+	/* Drain: serve the unicast queue into the DDR3 ring first, fully,
+	 * every poll, before the other queue is touched at all -- so a
+	 * broadcast/multicast backlog can never delay a unicast frame
+	 * that's already waiting. Each drain stops naturally once the ring
+	 * reports full (xu_rx_enqueue's own erxtail-based check); whatever
+	 * doesn't fit simply stays in its queue for the next poll instead
+	 * of being dropped outright. */
+	uint64_t erxtail = rd64(XU_ERXTAIL_OFF);
+	while (rxq_uni.count > 0)
+	{
+		struct xu_rx_pending *p = &rxq_uni.item[rxq_uni.head];
+		if (!xu_rx_enqueue(p->buf, p->len, erxtail)) break;
+		rxq_uni.head = (rxq_uni.head + 1) % XU_RXQ_DEPTH;
+		rxq_uni.count--;
+	}
+
+	erxtail = rd64(XU_ERXTAIL_OFF);  /* re-read: firmware may have advanced it while draining unicast */
+	while (rxq_other.count > 0)
+	{
+		struct xu_rx_pending *p = &rxq_other.item[rxq_other.head];
+		if (!xu_rx_enqueue(p->buf, p->len, erxtail)) break;
+		rxq_other.head = (rxq_other.head + 1) % XU_RXQ_DEPTH;
+		rxq_other.count--;
+	}
 }
 
 void xu_poll(void)
