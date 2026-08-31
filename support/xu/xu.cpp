@@ -424,34 +424,35 @@ static void xu_poll_rx(void)
 		xu_rxq_push(is_unicast_to_us ? &rxq_uni : &rxq_other, buf, (uint32_t)n);
 	}
 
-	/* Drain: serve the unicast queue into the DDR3 ring first, fully,
-	 * every poll, before the other queue is touched at all -- so a
-	 * broadcast/multicast backlog can never delay a unicast frame
-	 * that's already waiting. Each drain stops naturally once the ring
-	 * reports full (xu_rx_enqueue's own erxtail-based check); whatever
-	 * doesn't fit simply stays in its queue for the next poll instead
-	 * of being dropped outright. Gated on RXEN, unlike intake above --
-	 * matches real hardware (a real chip doesn't hand frames on to the
-	 * host ring while RXEN is clear either), and guarantees ERXTAIL is
-	 * validly initialized before the free-space math below ever runs. */
+	/* Drain: serve the unicast queue into the DDR3 ring first, every
+	 * poll, before the other queue is touched -- so a broadcast
+	 * backlog cannot delay a unicast frame that's already waiting.
+	 * At most 6 frames per poll (firmware's DEUNA ring). Gated on
+	 * RXEN; leftover stays queued. */
 	if (!((rd64(XU_STATUS_OFF) >> XU_STATUS_RXEN_BIT) & 1)) return;
 
+	/* Match firmware's 6-slot DEUNA ring: on the RXEN rising edge
+	 * do not dump the whole software backlog into DDR in one poll
+	 * (that makes PKTCNT jump past 6 and immediately re-throttle). */
+	int drain_left = 6;
 	uint64_t erxtail = (rd64(XU_STATUS_OFF) >> 48) & 0xFFFF;
-	while (rxq_uni.count > 0)
+	while (drain_left > 0 && rxq_uni.count > 0)
 	{
 		struct xu_rx_pending *p = &rxq_uni.item[rxq_uni.head];
 		if (!xu_rx_enqueue(p->buf, p->len, erxtail)) break;
 		rxq_uni.head = (rxq_uni.head + 1) % XU_RXQ_DEPTH;
 		rxq_uni.count--;
+		drain_left--;
 	}
 
-	erxtail = (rd64(XU_STATUS_OFF) >> 48) & 0xFFFF;  /* re-read: firmware may have advanced it while draining unicast */
-	while (rxq_other.count > 0)
+	erxtail = (rd64(XU_STATUS_OFF) >> 48) & 0xFFFF;
+	while (drain_left > 0 && rxq_other.count > 0)
 	{
 		struct xu_rx_pending *p = &rxq_other.item[rxq_other.head];
 		if (!xu_rx_enqueue(p->buf, p->len, erxtail)) break;
 		rxq_other.head = (rxq_other.head + 1) % XU_RXQ_DEPTH;
 		rxq_other.count--;
+		drain_left--;
 	}
 }
 
