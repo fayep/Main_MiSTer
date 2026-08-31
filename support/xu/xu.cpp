@@ -59,7 +59,8 @@ extern int  ethernet_set_mac_filter(const uint8_t *mac);
 extern void ethernet_clear_filter(void);
 
 #define XU_IFACE        "eth0"   /* shared onboard port, matching A2065's own default */
-#define XU_MAX_FRAME    1518
+#define XU_MAX_FRAME    1514     /* Ethernet header+payload, no FCS, no VLAN tag */
+#define XU_RECV_ROOM    1518     /* intake buffer: larger than MAX so oversize is dropped, not truncated */
 #define XU_RX_BATCH_MAX 64       /* matches A2065's own a2065_drain_rx() discipline --
                                    * bounded per-call work, Main is single-threaded */
 
@@ -73,6 +74,14 @@ static int card_up = 0;
 static int tx_pending = 0;
 static uint32_t erxhead_count = 0;      /* daemon's own monotonic frame-enqueued count */
 static uint32_t rx_wrpos = XU_BUF_RX_OFF; /* real byte position within the RX ring */
+static int rx_tail_moved = 0;           /* 0 until firmware has consumed into the
+                                          * ring interior (or finished a throttle
+                                          * drain). Distinguishes "first lap still
+                                          * unread at 0x4800" from "caught up, tail
+                                          * wrapped back to 0x5FFE". */
+static int rxen_was = 0;                /* previous poll's RXEN, for 1->0->1 latch */
+static int rx_saw_rxen_clear = 0;       /* set when RXEN drops with frames queued */
+static int rstseq_seen = 0;             /* 0 = not sampled yet; then 1/2 = last RSTSEQ bit+1 */
 static uint8_t g_mac[6];                /* published MAC, cached for xu_poll_rx()'s
                                           * unicast-vs-broadcast classification */
 
@@ -111,9 +120,12 @@ static inline void wr64(uint32_t off, uint64_t v)
 	*(volatile uint64_t*)(map + off) = v;
 }
 
-static int xu_core_active(void)
+/* XU_ERXHEAD_OFF: bits 31:0 = frame count, bits 47:32 = rx_wrpos (first
+ * unwritten RX byte). Published together so the shim's PKTCNT and
+ * readahead bound advance on the same word. */
+static void xu_publish_erxhead(void)
 {
-	return !strcasecmp(user_io_get_core_name(0), "PDP2011");
+	wr64(XU_ERXHEAD_OFF, (uint64_t)erxhead_count | ((uint64_t)rx_wrpos << 32));
 }
 
 static int xu_enabled(void)
@@ -179,18 +191,30 @@ static void xu_start(void)
 
 	rx_wrpos = XU_BUF_RX_OFF;
 	erxhead_count = 0;
-	wr64(XU_ERXHEAD_OFF, 0);
+	rx_tail_moved = 0;
+	rxen_was = 0;
+	rx_saw_rxen_clear = 0;
+	xu_publish_erxhead();
 	wr64(XU_TXRTS_DONE_OFF, 0);
 	tx_pending = 0;
 	xu_rxq_reset(&rxq_uni);
 	xu_rxq_reset(&rxq_other);
+	rstseq_seen = 0;
 
 	card_up = 1;
 	xu_log("[xu] started on %s\n", XU_IFACE);
 }
 
+/* one-shot "core detected" log, armed here rather than tracked inside
+ * xu_poll() -- see xu_poll()'s own comment. Reset unconditionally (not
+ * just when card_up) so a PDP2011 session that never got past the
+ * External Ethernet check still re-logs "detected" if the core is
+ * reloaded later. */
+static int logged_active = 0;
+
 void xu_stop(void)
 {
+	logged_active = 0;
 	if (!card_up) return;
 	card_up = 0;
 	ethernet_clear_filter();
@@ -204,16 +228,17 @@ void xu_stop(void)
  * xu_ddr_mailbox.vhd's own held-ack CDC discipline one layer up). */
 static void xu_poll_tx(void)
 {
-	uint64_t req = rd64(XU_TXRTS_REQ_OFF);
+	uint64_t status = rd64(XU_STATUS_OFF);
 
-	if (req & 1)
+	if ((status >> XU_STATUS_TXRTS_REQ_BIT) & 1)
 	{
 		if (!tx_pending)
 		{
-			uint32_t etxst  = (uint32_t)rd64(XU_ETXST_OFF);
-			uint32_t etxlen = (uint32_t)rd64(XU_ETXLEN_OFF);
-
-			xu_log("[xu] TX req: etxst=%u etxlen=%u\n", etxst, etxlen);
+			/* ETXST is never read: this firmware always writes it as 0
+			 * before every transmit (xmitst), so it's dropped from
+			 * XU_STATUS_OFF entirely -- see the field's own comment. */
+			uint32_t etxst  = 0;
+			uint32_t etxlen = (uint32_t)((status >> 16) & 0xFFFF);
 
 			if (etxlen > 0 && etxlen <= XU_MAX_FRAME && etxst < XU_BUF_TX_SIZE)
 			{
@@ -225,12 +250,7 @@ static void xu_poll_tx(void)
 				 * defensively against a malformed length. */
 				if (etxst + n > XU_BUF_TX_SIZE) n = XU_BUF_TX_SIZE - etxst;
 				memcpy(frame, (const void*)(map + XU_BUF_TX_OFF + etxst), n);
-				xu_log("[xu] TX sending %u bytes: %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x ethertype %02x%02x\n",
-					n, frame[6],frame[7],frame[8],frame[9],frame[10],frame[11],
-					frame[0],frame[1],frame[2],frame[3],frame[4],frame[5],
-					n>12?frame[12]:0, n>13?frame[13]:0);
 				ethernet_send(frame, (int)n);
-				xu_log("[xu] TX sent\n");
 			}
 			else
 			{
@@ -255,20 +275,41 @@ static void xu_poll_tx(void)
  * below can share it. */
 static int xu_rx_enqueue(const uint8_t *buf, uint32_t framelen, uint64_t erxtail)
 {
-	uint32_t need = 8 + framelen;
-	if (need & 1) need++;  /* real chip pads frames to an even boundary */
+	if (framelen > XU_MAX_FRAME) return 0;
 
+	uint32_t need = 8 + framelen;
+	/* Pad to an 8-byte (DDR3 word) boundary, not just even -- real chip
+	 * only requires even, but since rx_wrpos starts at XU_BUF_RX_OFF
+	 * (already a multiple of 8) and XU_BUF_RX_SIZE is also a multiple
+	 * of 8, padding need this way keeps every frame's start 8-byte
+	 * aligned for the life of the ring (by induction). That
+	 * guarantees the 8-byte header always lands entirely within one
+	 * DDR3 word. */
+	if (need & 7) need += 8 - (need & 7);
+
+	uint32_t phys_end = XU_BUF_RX_OFF + XU_BUF_RX_SIZE;
 	uint32_t start = rx_wrpos;
-	if (start + need > XU_BUF_RX_OFF + XU_BUF_RX_SIZE)
-	{
-		/* Doesn't fit before the region's physical end -- wrap the
-		 * whole frame to the start rather than physically splitting
-		 * it across the boundary. Real firmware only ever follows
-		 * the header's own next-pointer field, never assumes
-		 * physical contiguity past it, so this is safe; it just
-		 * wastes whatever trailing space didn't fit. */
-		start = XU_BUF_RX_OFF;
-	}
+
+	/* Firmware initenc and a full consume-to-wrap both leave ERXTAIL
+	 * at 0x5FFE. An interior tail means pktin drained at least one
+	 * frame -- also latched from RXEN 1->0->1 in xu_poll, because
+	 * the first-lap drain runs with RXEN clear so this path never
+	 * sees those tails. */
+	if (erxtail > XU_BUF_RX_OFF && erxtail < phys_end - 2)
+		rx_tail_moved = 1;
+
+	/* Jumped next_ptr to ERXST while the first lap is still unread.
+	 * Do not write at 0x4800 until firmware has consumed (live log
+	 * frames 10/11). After catch-up, tail_moved stays set even if
+	 * tail later wraps back to 0x5FFE. */
+	if (start == XU_BUF_RX_OFF && erxhead_count > 0 && !rx_tail_moved)
+		return 0;
+
+	/* Linear only -- never straddle 0x5FFF. The previous header's
+	 * next_ptr should already have jumped to 0x4800 if leftover
+	 * after that frame was below XU_RX_NOWRAP_MIN. */
+	if (start + need > phys_end)
+		return 0;
 
 	/* Real datasheet S9.2 behavior: "If ERXHEAD reaches ERXTAIL
 	 * while receiving a frame... the packet will be discarded and
@@ -278,8 +319,14 @@ static int xu_rx_enqueue(const uint8_t *buf, uint32_t framelen, uint64_t erxtail
 	                     : (XU_BUF_RX_SIZE - (start - erxtail));
 	if (free_space < need) return 0;
 
-	uint32_t next_ptr = start + need;
-	if (next_ptr >= XU_BUF_RX_OFF + XU_BUF_RX_SIZE) next_ptr = XU_BUF_RX_OFF;
+	uint32_t next = start + need;
+	uint32_t next_ptr = next;
+	/* Leftover too small for another max frame -- point firmware at
+	 * ERXST. Do not wait for tail here: after catch-up npp must
+	 * already be 0x4800 or the next write has nowhere to go. The
+	 * stomp guard above refuses to *write* at 0x4800 until drain. */
+	if (phys_end - next < XU_RX_NOWRAP_MIN)
+		next_ptr = XU_BUF_RX_OFF;
 
 	uint8_t hdr[8];
 	hdr[0] = (uint8_t)next_ptr;       hdr[1] = (uint8_t)(next_ptr >> 8);
@@ -293,12 +340,20 @@ static int xu_rx_enqueue(const uint8_t *buf, uint32_t framelen, uint64_t erxtail
 	memcpy((void*)(map + start), hdr, 8);
 	memcpy((void*)(map + start + 8), buf, framelen);
 
+	/* Full memory barrier: the frame's bytes above must be visible to an
+	 * external reader (the FPGA fabric, reading the same DDR3 through its
+	 * own port) before erxhead_count is published below -- otherwise the
+	 * shim could observe the new count before the data it counts, and
+	 * serve a frame that isn't actually there yet. volatile alone only
+	 * constrains the compiler, not the CPU's own store-buffer ordering as
+	 * seen by another bus master, and how this window is actually mapped
+	 * (normal bufferable memory vs. Strongly-Ordered) isn't something to
+	 * assume -- force it explicitly instead. */
+	__sync_synchronize();
+
 	rx_wrpos = next_ptr;
 	erxhead_count++;
-	wr64(XU_ERXHEAD_OFF, erxhead_count);
-	xu_log("[xu] RX frame %u: %u bytes, erxhead=%u, start=0x%04x next_ptr=0x%04x hdr=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-		erxhead_count, framelen, erxhead_count, start, next_ptr,
-		hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7]);
+	xu_publish_erxhead();
 	return 1;
 }
 
@@ -322,16 +377,27 @@ static int xu_rx_enqueue(const uint8_t *buf, uint32_t framelen, uint64_t erxtail
  * hold at once (real, observed backlogs of 100+ frames on a busy LAN) --
  * it's a software backlog buffer, not a mirror of ring capacity.
  *
- * RX: only once RXEN is set -- matches real hardware (a real ENC424J600
- * doesn't receive until RXEN is enabled either), and firmware's own real
- * init order always sets ERXTAIL before enabling RXEN, so this also
- * guarantees ERXTAIL is validly initialized (not its all-zero reset
- * value) before the free-space math below ever runs. */
+ * RX: intake (below) runs unconditionally, regardless of RXEN -- a real
+ * ENC424J600's PHY keeps receiving off the wire into the chip's own
+ * buffer independent of whether the host has RXEN set; RXEN only gates
+ * whether the chip hands frames on to the host's ring. Gating intake
+ * itself on RXEN (the bug this comment used to justify, 2026-08-31: real
+ * hardware test found ARP replies vanishing during firmware's own
+ * pktcnt>6 throttle windows, which clear RXEN -- confirmed via tcpdump
+ * that a reply arrived on the wire every single time but was never once
+ * read off the kernel socket) defeats the whole point of the
+ * rxq_uni/rxq_other priority queues above: they exist specifically to
+ * survive RXEN throttling, but a gate on intake meant nothing ever
+ * reached them while RXEN was clear, leaving packets sitting in the
+ * kernel's own socket buffer instead, silently droppable there with zero
+ * log visibility. Only the drain step (into DDR3) is gated on RXEN --
+ * firmware's own real init order always sets ERXTAIL before enabling
+ * RXEN, so drain gating still guarantees ERXTAIL is validly initialized
+ * (not its all-zero reset value) before the free-space math below ever
+ * runs, and matches real hardware's own drain-side semantics. */
 static void xu_poll_rx(void)
 {
-	if (!(rd64(XU_RXEN_OFF) & 1)) return;
-
-	uint8_t buf[XU_MAX_FRAME];
+	uint8_t buf[XU_RECV_ROOM];
 
 	/* Intake: read whatever's waiting on the one shared socket, up to a
 	 * bounded per-call budget (same discipline as before -- Main is
@@ -344,14 +410,18 @@ static void xu_poll_rx(void)
 		int n = ethernet_recv_nb(buf, sizeof buf);
 		if (n <= 0) break;  /* 0 = socket drained, <0 = error -- stop this pass either way */
 		if (n < 14) continue;  /* shorter than a full Ethernet header -- can't classify, drop */
+		if (n > (int)XU_MAX_FRAME)
+		{
+			xu_log("[xu] RX drop: %d-byte frame (max %d)\n", n, XU_MAX_FRAME);
+			continue;
+		}
 
 		uint16_t ethertype = ((uint16_t)buf[12] << 8) | buf[13];
 		if (ethertype != 0x0806 /* ARP */ && ethertype != 0x0800 /* IP */)
 			continue;
 
 		int is_unicast_to_us = (memcmp(buf, g_mac, 6) == 0);
-		if (!xu_rxq_push(is_unicast_to_us ? &rxq_uni : &rxq_other, buf, (uint32_t)n))
-			xu_log("[xu] RX backlog full (%s), dropping frame\n", is_unicast_to_us ? "unicast" : "other");
+		xu_rxq_push(is_unicast_to_us ? &rxq_uni : &rxq_other, buf, (uint32_t)n);
 	}
 
 	/* Drain: serve the unicast queue into the DDR3 ring first, fully,
@@ -360,8 +430,13 @@ static void xu_poll_rx(void)
 	 * that's already waiting. Each drain stops naturally once the ring
 	 * reports full (xu_rx_enqueue's own erxtail-based check); whatever
 	 * doesn't fit simply stays in its queue for the next poll instead
-	 * of being dropped outright. */
-	uint64_t erxtail = rd64(XU_ERXTAIL_OFF);
+	 * of being dropped outright. Gated on RXEN, unlike intake above --
+	 * matches real hardware (a real chip doesn't hand frames on to the
+	 * host ring while RXEN is clear either), and guarantees ERXTAIL is
+	 * validly initialized before the free-space math below ever runs. */
+	if (!((rd64(XU_STATUS_OFF) >> XU_STATUS_RXEN_BIT) & 1)) return;
+
+	uint64_t erxtail = (rd64(XU_STATUS_OFF) >> 48) & 0xFFFF;
 	while (rxq_uni.count > 0)
 	{
 		struct xu_rx_pending *p = &rxq_uni.item[rxq_uni.head];
@@ -370,7 +445,7 @@ static void xu_poll_rx(void)
 		rxq_uni.count--;
 	}
 
-	erxtail = rd64(XU_ERXTAIL_OFF);  /* re-read: firmware may have advanced it while draining unicast */
+	erxtail = (rd64(XU_STATUS_OFF) >> 48) & 0xFFFF;  /* re-read: firmware may have advanced it while draining unicast */
 	while (rxq_other.count > 0)
 	{
 		struct xu_rx_pending *p = &rxq_other.item[rxq_other.head];
@@ -380,23 +455,22 @@ static void xu_poll_rx(void)
 	}
 }
 
+/* Caller (user_io.cpp's is_pdp2011() gate) already guarantees the
+ * PDP2011 core is loaded whenever this runs -- no need to re-check that
+ * here the way earlier versions did with a per-call strcasecmp. */
 void xu_poll(void)
 {
-	/* one-shot diagnostics: helps tell "never detected" apart from
-	 * "detected but xu_start() failed" from /tmp/xu.log alone. */
-	static int logged_active = 0, logged_enabled = 0;
+	static int logged_enabled = 0;
 
-	int active = xu_core_active();
-	if (active && !logged_active)
+	if (!logged_active)
 	{
 		logged_active = 1;
 		xu_log("[xu] core detected: \"%s\"\n", user_io_get_core_name(0));
 	}
-	else if (!active) logged_active = 0;
 
-	if (!active || !xu_enabled())
+	if (!xu_enabled())
 	{
-		if (active && !logged_enabled)
+		if (!logged_enabled)
 		{
 			logged_enabled = 1;
 			xu_log("[xu] core active but External Ethernet is off\n");
@@ -408,6 +482,39 @@ void xu_poll(void)
 
 	if (!card_up) xu_start();
 	if (!card_up) return;
+
+	uint64_t status = rd64(XU_STATUS_OFF);
+	int rstseq = ((status >> XU_STATUS_RSTSEQ_BIT) & 1) + 1;
+	if (!rstseq_seen)
+		rstseq_seen = rstseq;
+	else if (rstseq != rstseq_seen)
+	{
+		rstseq_seen = rstseq;
+		rx_wrpos = XU_BUF_RX_OFF;
+		erxhead_count = 0;
+		rx_tail_moved = 0;
+		rxen_was = 0;
+		rx_saw_rxen_clear = 0;
+		xu_publish_erxhead();
+		xu_log("[xu] chip reset, RX ring restarted at 0x4800\n");
+	}
+
+	/* Sample ERXTAIL and RXEN every poll, not only on enqueue.
+	 * First-lap drain clears RXEN (firmware throttle), so enqueue
+	 * never runs while the interior tails exist. After catch-up
+	 * tail is 0x5FFE again -- same as init -- and the wrap write
+	 * at 0x4800 would stall forever without this latch. */
+	{
+		uint32_t erxtail = (uint32_t)((status >> 48) & 0xFFFF);
+		int rxen = (int)((status >> XU_STATUS_RXEN_BIT) & 1);
+		if (erxtail > XU_BUF_RX_OFF && erxtail < XU_BUF_RX_OFF + XU_BUF_RX_SIZE - 2)
+			rx_tail_moved = 1;
+		if (rxen_was && !rxen && erxhead_count > 0)
+			rx_saw_rxen_clear = 1;
+		if (rx_saw_rxen_clear && rxen && !rx_tail_moved)
+			rx_tail_moved = 1;
+		rxen_was = rxen;
+	}
 
 	xu_poll_tx();
 	xu_poll_rx();

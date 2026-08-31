@@ -241,6 +241,16 @@ char is_x86()
 	return (is_x86_type == 1);
 }
 
+/* Ordinary CORE_TYPE_8BIT core, cached the same way is_x86() is -- see
+ * support/xu/xu.cpp's xu_poll()/xu_stop(), the only caller. */
+static int is_pdp2011_type = 0;
+char is_pdp2011()
+{
+	if (!is_pdp2011_type)
+		is_pdp2011_type = !strcasecmp(orig_name, "PDP2011") ? 1 : 2;
+	return (is_pdp2011_type == 1);
+}
+
 static int is_snes_type = 0;
 char is_snes()
 {
@@ -452,6 +462,7 @@ void user_io_read_core_name()
 	is_zx81_type = 0;
 	is_neogeo_type = 0;
 	is_minimig_type = 0;
+	is_pdp2011_type = 0;
 	is_megacd_type = 0;
 	is_pce_type = 0;
 	is_archie_type = 0;
@@ -3217,13 +3228,13 @@ void user_io_poll()
 		a2065_poll();
 	}
 
-	// Unlike A2065 (Minimig-only), XU is an ordinary CORE_TYPE_8BIT core
-	// with no dedicated boot-path hook -- xu_poll() checks the loaded core
-	// name and its own OSD status bit internally on every call, so it must
-	// run unconditionally here (outside the is_minimig() block above),
-	// alongside every other 8BIT/SHARPMZ core this function already
-	// services per the function's own top-level gate.
-	xu_poll();
+	// Matches a2065_poll()'s own is_minimig() gate above -- is_pdp2011()
+	// is a cached check (user_io.cpp), not a live strcasecmp every call.
+	// xu_stop() still runs unconditionally from user_io_init() on every
+	// core switch (matching a2065_stop()), so gating the call here loses
+	// no cleanup: xu_poll() simply never runs while a different core is
+	// loaded, same as a2065_poll() never runs outside is_minimig().
+	if (is_pdp2011()) xu_poll();
 
 	if (core_type == CORE_TYPE_8BIT && !is_menu())
 	{

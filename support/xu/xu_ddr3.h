@@ -28,17 +28,45 @@
 #define XU_BUF_TX_SIZE         0x4800UL
 #define XU_BUF_RX_OFF          0x4800UL   /* RX ring, 6KB */
 #define XU_BUF_RX_SIZE         0x1800UL
+/* If leftover to RX_OFF+RX_SIZE after this frame is below this, next_ptr
+ * is ERXST (0x4800) instead of wrapping. 8-byte RSV + 1514-byte max
+ * Ethernet frame pads to 1528 -- the next frame then starts at the ring
+ * base, never straddles 0x5FFF. */
+#define XU_RX_NOWRAP_MIN       1528UL
 
-/* ── Control fields, each in its own 8-byte-aligned slot (one writer
- * each, per the ownership analysis in the plan -- never pack two fields
- * with different writers into the same word) ───────────────────────── */
-#define XU_RXEN_OFF            0x6000UL   /* shim writes once at init, daemon reads */
-#define XU_TXRTS_REQ_OFF       0x6008UL   /* shim sole writer */
+/* ── Control fields. Fields with different writers stay in their own
+ * 8-byte-aligned slot (never pack two fields with different writers into
+ * the same word -- that's the real hazard the original per-field split
+ * avoided). But RXEN/TXRTS_REQ/ETXLEN/ERXST/ERXTAIL are all shim-sole-
+ * writer, all rare/firmware-paced, and all needed together by the
+ * daemon's own TX/RX handling -- packed into one XU_STATUS_OFF word so
+ * the shim can publish all of them in a single atomic mailbox write,
+ * with no ordering/clobbering question between them at all. ETXST is
+ * dropped entirely: this firmware always writes it as 0 before every
+ * transmit (xmitst), so the daemon just assumes 0 -- if that ever
+ * changes, this needs revisiting. ─────────────────────────────────── */
+#define XU_STATUS_OFF          0x6000UL   /* shim sole writer -- see xu_status_t below */
 #define XU_TXRTS_DONE_OFF      0x6010UL   /* daemon sole writer, held until REQ drops */
-#define XU_ETXST_OFF           0x6018UL   /* shim writes, daemon reads */
-#define XU_ETXLEN_OFF          0x6020UL   /* shim writes, daemon reads */
-#define XU_ERXST_OFF           0x6028UL   /* shim writes once at init */
-#define XU_ERXHEAD_OFF         0x6030UL   /* daemon's own monotonic frame-enqueued count; shim derives PKTCNT locally */
-#define XU_ERXTAIL_OFF         0x6038UL   /* shim writes, daemon reads */
+#define XU_ERXHEAD_OFF         0x6030UL   /* daemon sole writer -- see layout below */
 #define XU_MAC_ADDR_OFF        0x6040UL   /* daemon writes once at start; low 48 bits */
 #define XU_MAC_VALID_OFF       0x6048UL   /* daemon writes; 0 until MAC_ADDR is valid */
+/* XU_ERXHEAD_OFF 64-bit word, little-endian, daemon sole writer:
+ *   bits 15:0  -- monotonic frame-enqueued count (shim PKTCNT)
+ *   bits 31:16 -- unused (0)
+ *   bits 47:32 -- rx_wrpos, first unwritten RX byte (readahead bound)
+ *   bits 63:48 -- unused (0)
+ * A count-only write (high bits 0) is the old daemon; the shim then keeps
+ * the ERXTAIL readahead bound. */
+
+/* XU_STATUS_OFF's 8-byte layout, LSB first:
+ *   byte 0: bit0 = RXEN, bit1 = TXRTS_REQ, bit2 = RSTSEQ (toggles on
+ *           ETHRST so the daemon can restart rx_wrpos), bits 3-7 reserved
+ *   byte 1: reserved (0) -- mirrors ECON1's real 16-bit chip-protocol
+ *           slot, only the low byte is ever meaningful
+ *   bytes 2-3: ETXLEN (16-bit LE)
+ *   bytes 4-5: ERXST  (16-bit LE)
+ *   bytes 6-7: ERXTAIL (16-bit LE)
+ */
+#define XU_STATUS_RXEN_BIT      0
+#define XU_STATUS_TXRTS_REQ_BIT 1
+#define XU_STATUS_RSTSEQ_BIT    2
