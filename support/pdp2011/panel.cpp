@@ -146,6 +146,16 @@ static void ensure_halt(void)
 	WaitTimer(4);
 }
 
+/* Resume full-speed execution: drop the Halt toggle so cons_ena is 1
+ * before the Continue pulse, otherwise state_halt takes the pulse as a
+ * single-step (consolestep) and drops straight back to HALT. */
+static void resume_run(void)
+{
+	user_io_status_set("[16]", 0);
+	WaitTimer(4);
+	pulse("[17]");
+}
+
 static int parse_oct(const char *s, uint32_t *out)
 {
 	char *end = 0;
@@ -187,7 +197,7 @@ static void odt_cmd(int fd, char *line)
 	}
 	if (!strcmp(cmd, "help")) {
 		odt_reply(fd,
-			"snap halt run cont start\n"
+			"snap halt run|cont step start\n"
 			"load <oct>  exa  dep <oct>  sr <oct>\n"
 			"peek <oct>  poke <oct> <oct>\n"
 			"r7 <oct>    (17600000 + 177707)\n");
@@ -201,17 +211,18 @@ static void odt_cmd(int fd, char *line)
 		odt_reply(fd, reply);
 		return;
 	}
-	if (!strcmp(cmd, "run") || !strcmp(cmd, "go")) {
-		/* Leave state_halt with cons_ena=1 so Continue actually runs. */
-		user_io_status_set("[16]", 0);
-		WaitTimer(4);
-		pulse("[17]");
+	/* run / cont / go: resume full-speed execution (e.g. after peek/exa,
+	 * which leave the CPU halted). */
+	if (!strcmp(cmd, "run") || !strcmp(cmd, "go") ||
+	    !strcmp(cmd, "cont") || !strcmp(cmd, "c")) {
+		resume_run();
 		panel_read(&s);
 		fmt_snap(reply, sizeof(reply), &s);
 		odt_reply(fd, reply);
 		return;
 	}
-	if (!strcmp(cmd, "cont") || !strcmp(cmd, "c")) {
+	/* step / s: execute a single instruction and halt again. */
+	if (!strcmp(cmd, "step") || !strcmp(cmd, "s")) {
 		ensure_halt();
 		pulse("[17]");
 		panel_read(&s);
