@@ -16,20 +16,51 @@ def talk(line):
         return 2
     s.sendall((line.strip() + "\n").encode())
     buf = b""
-    s.settimeout(8)
+    # `trace` (no start/count) can pull up to DEPTH (16384) events =
+    # 131075 individual spi_w() calls (each a real ARM<->FPGA GPIO
+    # handshake with ACK polling, not free) plus a server-side write()
+    # per ~2KB chunk -- 60s was itself found too short empirically (a
+    # full drain can apparently take 60-120+s on real hardware), so this
+    # is set high enough to find out where it ACTUALLY lands rather than
+    # guessing again. A longer timeout costs nothing for the fast
+    # commands (snap/peek/poke), which still return in well under a
+    # second.
+    #
+    # NOTE: a bare `trace` MUST be sent as ONE command over ONE
+    # connection (this function does exactly that). tracecap_dbg.sv
+    # resets its read pointer to 0 every time command 0x51 is
+    # re-claimed, so re-issuing separate trace(start,N)/trace(start+N,N)
+    # calls over FRESH connections to fake "chunked" progress re-walks
+    # 0..start from scratch every single call -- turning an O(total)
+    # drain into an O(total^2) one. That was tried and made things
+    # dramatically worse, not better (see panel.cpp's trace_dump()
+    # comment). Incremental progress comes from streaming stdout below
+    # as the one real drain's output arrives, not from splitting the
+    # request itself.
+    s.settimeout(300)
+    tail = b""  # last few bytes carried across chunks, to catch a
+                # ".\n" terminator that lands split across two recv()s
     while True:
         try:
             chunk = s.recv(4096)
         except socket.timeout:
-            sys.stderr.write("pdp-odt: timeout\n")
+            sys.stderr.write("pdp-odt: timeout (received %d bytes before giving up)\n" % len(buf))
             return 1
         if not chunk:
             break
+        # Write each chunk to stdout as it arrives -- the server side
+        # already flushes incrementally (a full trace drain can take
+        # real time on hardware), and buffering everything here until
+        # the end made a slow-but-working drain look identical to a
+        # genuine hang: "nothing output" stopped being informative.
+        sys.stdout.write(chunk.decode("ascii", "replace"))
+        sys.stdout.flush()
         buf += chunk
-        if b"\n.\n" in buf or buf.endswith(b".\n"):
+        window = tail + chunk
+        if b"\n.\n" in window or window.endswith(b".\n"):
             break
+        tail = chunk[-2:]
     s.close()
-    sys.stdout.write(buf.decode("ascii", "replace"))
     return 0 if b"\nERR" not in b"\n" + buf else 1
 
 

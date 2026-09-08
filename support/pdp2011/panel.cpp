@@ -175,6 +175,115 @@ static void odt_reply(int fd, const char *s)
 	(void)write(fd, ".\n", 2);
 }
 
+/* tracecap.vhd's default DEPTH_LOG2=14 (16384 entries) -- see
+ * rtl/tracecap_pkg.vhd / rtl/tracecap.vhd. If that generic ever
+ * changes, this needs to change with it. */
+#define TRACE_DEPTH 16384
+
+/* Drains the tracecap.vhd/tracecap_dbg.sv event ring (EXT_BUS command
+ * 0x51) and writes one line per event to `fd`, terminated the same
+ * "body then a lone '.' line" way odt_reply() does -- unlike every
+ * other command here this can be many lines, so it writes directly
+ * rather than building one reply[] buffer. Word-packing matches
+ * rtl/tracecap_dbg.sv's own header comment exactly:
+ *   word0=flags, word1=wr_ptr, word2=reserved, then per event:
+ *   {kind,id,0}, a_hi, a_lo, b_hi, b_lo, c.
+ */
+/* `start`/`want` window the drain: only events [start, start+want) are
+ * formatted and sent. want<0 means "to the end". tracecap_dbg.sv has
+ * no seek -- it only walks rd_addr forward one step per spi_w() call
+ * -- so a window is implemented by silently discarding the leading
+ * words we don't want, then STOPPING once we have `want` events
+ * instead of always draining the whole ring. That's a real, useful
+ * property on its own (a small window costs only start+want word
+ * transfers, not TRACE_DEPTH*6), independent of debugging anything --
+ * added after a full 16384-event drain proved unreliable enough in
+ * practice to want a cheaper, boundable alternative. */
+static void trace_dump(int fd, int start, int want)
+{
+	/* Batched into a big buffer and flushed in chunks rather than one
+	 * write() syscall per event line -- draining many events is
+	 * already a lot of real SPI transfer work (6 words/event); adding
+	 * one socket syscall per event on top of that was real, avoidable
+	 * overhead that made a full drain slow enough to need a longer
+	 * client-side timeout (see pdp-odt's own comment on this). */
+	/* Deliberately small (~40 events/flush, not ~320) so a hang partway
+	 * through the loop still shows real progress to the client instead
+	 * of looking identical to a hang on the very first transfer -- see
+	 * the flush right after the header line below for the same reason. */
+	static char buf[2048];
+	size_t used = 0;
+
+	/* spi_uio_cmd_cont() itself returns the FPGA's response to the
+	 * command word (tracecap_dbg.sv's cnt==0 beat, i.e. `flags`) --
+	 * discarding it the way panel_read() discards panel_dbg.sv's own
+	 * cnt==0 beat would silently shift every later word back by one,
+	 * which is exactly the bug this comment is here to stop someone
+	 * (including a future me) from reintroducing. */
+	uint16_t flags = spi_uio_cmd_cont(UIO_PDP_TRACE);
+	uint16_t wr_ptr = spi_w(0);
+	(void)spi_w(0);  /* reserved */
+
+	if (!(flags & 1)) {
+		DisableIO();
+		odt_reply(fd, "ERR no tracecap_dbg (module not present)\n");
+		return;
+	}
+	int overflowed = (flags >> 1) & 1;
+	int total = overflowed ? TRACE_DEPTH : wr_ptr;
+
+	if (start < 0) start = 0;
+	if (start > total) start = total;
+	int end = (want < 0) ? total : start + want;
+	if (end > total) end = total;
+
+	used += snprintf(buf + used, sizeof(buf) - used,
+		"count=%d wrap=%d start=%d end=%d\n", total, overflowed, start, end);
+	/* Flush the header immediately, before the loop -- otherwise a hang
+	 * anywhere in the per-event loop below is indistinguishable from a
+	 * hang on the very first transfer (both look like "zero bytes
+	 * received" to the client), which defeats debugging exactly the
+	 * kind of problem this is here to catch. */
+	write(fd, buf, used);
+	used = 0;
+
+	/* Skip leading events outside the window -- still real SPI work
+	 * (there's no seek), but no formatting/writing, and critically we
+	 * stop entirely once `end` is reached rather than draining the
+	 * rest of the ring unconditionally. */
+	for (int i = 0; i < start; i++) {
+		spi_w(0); spi_w(0); spi_w(0); spi_w(0); spi_w(0); spi_w(0);
+	}
+
+	for (int i = start; i < end; i++) {
+		uint16_t w0 = spi_w(0);
+		uint16_t a_hi = spi_w(0);
+		uint16_t a_lo = spi_w(0);
+		uint16_t b_hi = spi_w(0);
+		uint16_t b_lo = spi_w(0);
+		uint16_t c = spi_w(0);
+
+		unsigned kind = (w0 >> 12) & 0xF;
+		unsigned id = (w0 >> 8) & 0xF;
+		uint32_t a = ((uint32_t)(a_hi & 0x3F) << 16) | a_lo;
+		uint32_t b = ((uint32_t)(b_hi & 0x3F) << 16) | b_lo;
+
+		/* Longest possible line is well under 64 bytes; leave a safety
+		 * margin before flushing so a line is never split mid-write. */
+		if (used + 64 > sizeof(buf)) {
+			write(fd, buf, used);
+			used = 0;
+		}
+		used += snprintf(buf + used, sizeof(buf) - used,
+			"%4d kind=%o id=%o a=%07o b=%07o c=%06o\n",
+			i, kind, id, a, b, c);
+	}
+	DisableIO();
+
+	if (used) write(fd, buf, used);
+	write(fd, ".\n", 2);
+}
+
 static void odt_cmd(int fd, char *line)
 {
 	char reply[256];
@@ -200,7 +309,18 @@ static void odt_cmd(int fd, char *line)
 			"snap halt run|cont step start\n"
 			"load <oct>  exa  dep <oct>  sr <oct>\n"
 			"peek <oct>  poke <oct> <oct>\n"
-			"r7 <oct>    (17600000 + 177707)\n");
+			"r7 <oct>    (17600000 + 177707)\n"
+			"trace [<start> <count>]  dump tracecap ring (kind: 1=disk\n"
+			"            2=parw); start/count are plain DECIMAL event\n"
+			"            indices (not octal -- they're array indices,\n"
+			"            not PDP-11 values), and a window costs only\n"
+			"            start+count SPI transfers, not the whole ring\n");
+		return;
+	}
+	if (!strcmp(cmd, "trace")) {
+		int t_start = 0, t_count = -1;
+		if (*arg) sscanf(arg, "%d %d", &t_start, &t_count);
+		trace_dump(fd, t_start, t_count);
 		return;
 	}
 	if (!strcmp(cmd, "halt")) {
