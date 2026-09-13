@@ -65,7 +65,7 @@ def talk(line):
 
 
 def repl():
-    sys.stdout.write("pdp-odt  (help, snap, halt, run|cont, step, peek <oct>, poke <oct> <oct>, r7 <oct>)\n")
+    sys.stdout.write("pdp-odt  (help, snap, halt, run|cont, step, peek <oct>, poke <oct> <oct>, r7 <oct>, break <oct>, unbreak)\n")
     while True:
         try:
             line = input("odt> ")

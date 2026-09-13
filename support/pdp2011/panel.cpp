@@ -187,7 +187,20 @@ static void odt_reply(int fd, const char *s)
  * rather than building one reply[] buffer. Word-packing matches
  * rtl/tracecap_dbg.sv's own header comment exactly:
  *   word0=flags, word1=wr_ptr, word2=reserved, then per event:
- *   {kind,id,0}, a_hi, a_lo, b_hi, b_lo, c.
+ *   {kind,id,0}, a_hi, a_lo, b_hi, b_lo, c, kdpar5, kdpar6, kipar5, kipar6.
+ * kdpar5/kdpar6/kipar5/kipar6 are disk events only: rl11.vhd/rh11.vhd's
+ * live copies of mmu.vhd's KERNEL D-space AND I-space PAR5/PAR6,
+ * sampled at the same READ+GO trigger moment as a/b/c -- see
+ * tracecap_pkg.vhd's TRACE_D_WIDTH comment. kipar5/kipar6 (17772352/
+ * 17772354) are the pair RSTS's real overlay-mapping mechanism actually
+ * uses (notes/rsts-init-disasm.md's MAPCOPY_PARAM); kdpar5/kdpar6
+ * (17772372/17772374, D-space) were this session's original wrong
+ * guess at which pair mattered, kept anyway since something else in
+ * RSTS does write real values there too. No standalone PAR-write event
+ * kind: PAR5/6 change far too often to log as their own events without
+ * drowning every disk event (confirmed on real hardware: 16222 of
+ * 16384 ring entries were PAR-write events, zero disk events
+ * survived).
  */
 /* `start`/`want` window the drain: only events [start, start+want) are
  * formatted and sent. want<0 means "to the end". tracecap_dbg.sv has
@@ -196,14 +209,14 @@ static void odt_reply(int fd, const char *s)
  * words we don't want, then STOPPING once we have `want` events
  * instead of always draining the whole ring. That's a real, useful
  * property on its own (a small window costs only start+want word
- * transfers, not TRACE_DEPTH*6), independent of debugging anything --
+ * transfers, not TRACE_DEPTH*10), independent of debugging anything --
  * added after a full 16384-event drain proved unreliable enough in
  * practice to want a cheaper, boundable alternative. */
 static void trace_dump(int fd, int start, int want)
 {
 	/* Batched into a big buffer and flushed in chunks rather than one
 	 * write() syscall per event line -- draining many events is
-	 * already a lot of real SPI transfer work (6 words/event); adding
+	 * already a lot of real SPI transfer work (10 words/event); adding
 	 * one socket syscall per event on top of that was real, avoidable
 	 * overhead that made a full drain slow enough to need a longer
 	 * client-side timeout (see pdp-odt's own comment on this). */
@@ -252,31 +265,45 @@ static void trace_dump(int fd, int start, int want)
 	 * stop entirely once `end` is reached rather than draining the
 	 * rest of the ring unconditionally. */
 	for (int i = 0; i < start; i++) {
-		spi_w(0); spi_w(0); spi_w(0); spi_w(0); spi_w(0); spi_w(0);
+		/* fpga_spi() busy-waits on the GPIO ACK with no yield of its
+		 * own; a full drain is ~10 of those per event back-to-back and
+		 * would hold this single-threaded process's CPU for the whole
+		 * drain, starving everything else it owns (and, on a long
+		 * enough drain, getting it killed). Give the scheduler a slot
+		 * every 32 events -- ~100us each, a few tens of ms total even
+		 * for a 16k-deep buffer, imperceptible next to the SPI cost. */
+		if ((i & 31) == 0) usleep(100);
+		spi_w(0); spi_w(0); spi_w(0); spi_w(0); spi_w(0);
+		spi_w(0); spi_w(0); spi_w(0); spi_w(0); spi_w(0);
 	}
 
 	for (int i = start; i < end; i++) {
+		if ((i & 31) == 0) usleep(100);
 		uint16_t w0 = spi_w(0);
 		uint16_t a_hi = spi_w(0);
 		uint16_t a_lo = spi_w(0);
 		uint16_t b_hi = spi_w(0);
 		uint16_t b_lo = spi_w(0);
 		uint16_t c = spi_w(0);
+		uint16_t kdpar5 = spi_w(0);
+		uint16_t kdpar6 = spi_w(0);
+		uint16_t kipar5 = spi_w(0);
+		uint16_t kipar6 = spi_w(0);
 
 		unsigned kind = (w0 >> 12) & 0xF;
 		unsigned id = (w0 >> 8) & 0xF;
 		uint32_t a = ((uint32_t)(a_hi & 0x3F) << 16) | a_lo;
 		uint32_t b = ((uint32_t)(b_hi & 0x3F) << 16) | b_lo;
 
-		/* Longest possible line is well under 64 bytes; leave a safety
+		/* Longest possible line is well under 128 bytes; leave a safety
 		 * margin before flushing so a line is never split mid-write. */
-		if (used + 64 > sizeof(buf)) {
+		if (used + 128 > sizeof(buf)) {
 			write(fd, buf, used);
 			used = 0;
 		}
 		used += snprintf(buf + used, sizeof(buf) - used,
-			"%4d kind=%o id=%o a=%07o b=%07o c=%06o\n",
-			i, kind, id, a, b, c);
+			"%4d kind=%o id=%o a=%07o b=%07o c=%06o kdpar5=%06o kdpar6=%06o kipar5=%06o kipar6=%06o\n",
+			i, kind, id, a, b, c, kdpar5, kdpar6, kipar5, kipar6);
 	}
 	DisableIO();
 
@@ -314,13 +341,41 @@ static void odt_cmd(int fd, char *line)
 			"            2=parw); start/count are plain DECIMAL event\n"
 			"            indices (not octal -- they're array indices,\n"
 			"            not PDP-11 values), and a window costs only\n"
-			"            start+count SPI transfers, not the whole ring\n");
+			"            start+count SPI transfers, not the whole ring\n"
+			"break <oct> arm a PC-compare breakpoint: halts (like a\n"
+			"            manual halt, clearable by cont/run) when PC\n"
+			"            next reaches <oct>. Does not halt the CPU to\n"
+			"            arm it -- fires on a later, real arrival.\n"
+			"unbreak     disarm the breakpoint\n");
 		return;
 	}
 	if (!strcmp(cmd, "trace")) {
 		int t_start = 0, t_count = -1;
 		if (*arg) sscanf(arg, "%d %d", &t_start, &t_count);
 		trace_dump(fd, t_start, t_count);
+		return;
+	}
+	/* break <oct>: arm a PC-compare breakpoint (rtl/brk_compare.vhd) --
+	 * halts the CPU (same as a manual halt, clearable by "cont"/"run"
+	 * the same way) the next time its PC reaches <oct>. Deliberately
+	 * does NOT call ensure_halt() -- the whole point is to arm this
+	 * while the CPU keeps running, so it can catch a real, naturally
+	 * occurring arrival at that address later. */
+	if (!strcmp(cmd, "break")) {
+		if (!parse_oct(arg, &a)) { odt_reply(fd, "ERR break <oct>\n"); return; }
+		spi_uio_cmd_cont(UIO_PDP_BRK);
+		spi_w(1);
+		spi_w((uint16_t)a);
+		DisableIO();
+		odt_reply(fd, "OK\n");
+		return;
+	}
+	if (!strcmp(cmd, "unbreak")) {
+		spi_uio_cmd_cont(UIO_PDP_BRK);
+		spi_w(0);
+		spi_w(0);
+		DisableIO();
+		odt_reply(fd, "OK\n");
 		return;
 	}
 	if (!strcmp(cmd, "halt")) {

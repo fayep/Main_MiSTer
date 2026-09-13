@@ -5,6 +5,7 @@
 
 #define UIO_PDP_PANEL 0x50
 #define UIO_PDP_TRACE 0x51
+#define UIO_PDP_BRK   0x52
 
 /* Fill lines[0] (PC/PSW/RUN) and lines[1] (*PC, MA, D). Returns 1 if
  * either line should be redrawn. */
