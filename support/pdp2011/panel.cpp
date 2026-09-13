@@ -360,12 +360,21 @@ static void odt_cmd(int fd, char *line)
 	 * the same way) the next time its PC reaches <oct>. Deliberately
 	 * does NOT call ensure_halt() -- the whole point is to arm this
 	 * while the CPU keeps running, so it can catch a real, naturally
-	 * occurring arrival at that address later. */
+	 * occurring arrival at that address later.
+	 *
+	 * Address sent BEFORE enable, not the reverse -- found and fixed
+	 * 2026-09-13 after this exact reversed order caused a real false
+	 * breakpoint hit on real hardware at an unrelated PC. addr/enable
+	 * cross into cpuclk via independent 2-flop synchronizers in
+	 * brk_compare.vhd; if enable's new value settles first, there's a
+	 * real window where the breakpoint reads as armed against the
+	 * STALE previous (or power-up-undefined) address rather than the
+	 * one just requested. See rtl/brk_dbg.sv's matching comment. */
 	if (!strcmp(cmd, "break")) {
 		if (!parse_oct(arg, &a)) { odt_reply(fd, "ERR break <oct>\n"); return; }
 		spi_uio_cmd_cont(UIO_PDP_BRK);
-		spi_w(1);
 		spi_w((uint16_t)a);
+		spi_w(1);
 		DisableIO();
 		odt_reply(fd, "OK\n");
 		return;
