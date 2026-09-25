@@ -346,7 +346,11 @@ static void odt_cmd(int fd, char *line)
 			"            manual halt, clearable by cont/run) when PC\n"
 			"            next reaches <oct>. Does not halt the CPU to\n"
 			"            arm it -- fires on a later, real arrival.\n"
-			"unbreak     disarm the breakpoint\n");
+			"unbreak     disarm the breakpoint\n"
+			"brkdbg      read back brk_compare.vhd's real internal state\n"
+			"            (cfg_addr_safe, pc_d, cfg_enabled_safe, toggle_s2,\n"
+			"            real_arrival) -- for diagnosing a false/unexpected\n"
+			"            breakpoint hit with real evidence, not guessing\n");
 		return;
 	}
 	if (!strcmp(cmd, "trace")) {
@@ -374,6 +378,19 @@ static void odt_cmd(int fd, char *line)
 		if (!parse_oct(arg, &a)) { odt_reply(fd, "ERR break <oct>\n"); return; }
 		spi_uio_cmd_cont(UIO_PDP_BRK);
 		spi_w((uint16_t)a);
+		/* Real gap between addr and enable within the SAME transaction
+		 * (io_enable stays asserted -- dropping it here would reset
+		 * brk_dbg.sv's own cnt state machine, making the next spi_w()
+		 * look like a fresh command's first payload word, not enable).
+		 * cpuclk (where brk_compare.vhd's synchronizer runs) is a
+		 * DIVIDED, much slower clock than clk_sys (where brk_dbg.sv
+		 * latches these words); if both SPI words landed within a
+		 * single cpuclk period, the ordering fix alone might not be
+		 * visible to that slower domain. 1ms is enormous next to
+		 * either clock, cheap insurance while this is still being
+		 * diagnosed (2026-09-13, ordering fix alone did not resolve a
+		 * real false-hit-at-unrelated-PC repro). */
+		usleep(1000);
 		spi_w(1);
 		DisableIO();
 		odt_reply(fd, "OK\n");
@@ -385,6 +402,30 @@ static void odt_cmd(int fd, char *line)
 		spi_w(0);
 		DisableIO();
 		odt_reply(fd, "OK\n");
+		return;
+	}
+	/* brkdbg: real-hardware readback of brk_compare.vhd's internal
+	 * cpuclk-domain state (rtl/brk_dbg.sv's CMD_DBG, added 2026-09-25).
+	 * Added because a simulation-only reproduction of a real false
+	 * breakpoint hit (halt at an address that was neither the old nor
+	 * new armed target) turned out to be a bug in the TESTBENCH's own
+	 * stimulus, not the DUT -- there was no way to confirm or rule out
+	 * what brk_compare actually saw on real hardware at the moment of a
+	 * real halt, only PC-at-halt. This lets an investigation pull that
+	 * real state directly instead of guessing. */
+	if (!strcmp(cmd, "brkdbg")) {
+		spi_uio_cmd_cont(UIO_PDP_BRK_DBG);
+		uint16_t addr_safe = spi_w(0);
+		uint16_t pc_d = spi_w(0);
+		uint16_t status = spi_w(0);
+		DisableIO();
+		char addr_o[7], pcd_o[7];
+		oct6(addr_o, addr_safe);
+		oct6(pcd_o, pc_d);
+		snprintf(reply, sizeof(reply),
+			"cfg_addr_safe %s pc_d %s cfg_enabled_safe=%d toggle_s2=%d real_arrival=%d\n",
+			addr_o, pcd_o, (status >> 1) & 1, status & 1, (status >> 2) & 1);
+		odt_reply(fd, reply);
 		return;
 	}
 	if (!strcmp(cmd, "halt")) {
