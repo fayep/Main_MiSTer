@@ -46,6 +46,7 @@
 #include "support/pdp2011/panel.h"
 #include "support/pdp2011/tapeconv.h"
 #include "support/pdp2011/tu58.h"
+#include "support/pdp2011/diskcompat.h"
 
 static char core_path[1024] = {};
 static char rbf_path[1024] = {};
@@ -2182,6 +2183,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 
 				writable = pdp2011_tape_streaming(index) ? 0 : FileCanWrite(name);
 				ret = FileOpenEx(&sd_image[index], name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
+				if (is_pdp2011() && index <= 2) pdp2011_disk_mounted(index, ret ? &sd_image[index] : NULL);
 				if (pdp2011_tape_streaming(index))
 				{
 					if (!ret) pdp2011_tape_detach(index);
@@ -3431,6 +3433,12 @@ void user_io_poll()
 						printf("Error in creating file: %s\n", sd_image[disk].path);
 					}
 				}
+				else if (is_pdp2011() && disk <= 2 &&
+					pdp2011_disk_write(disk, &sd_image[disk], lba * blksz, buffer[disk], sz))
+				{
+					// PDP2011: grew a short image, or kept an RL bad-sector table virtual
+					diskled_on();
+				}
 				else
 				{
 					// ... and write it to disk
@@ -3549,6 +3557,10 @@ void user_io_poll()
 						}
 					}
 
+					// PDP2011 RL: an image without a bad-sector table reads as having an empty one
+					if (is_pdp2011() && disk == 1)
+						pdp2011_disk_read_fixup(disk, &sd_image[disk], lba * blksz, (uint8_t *)buffer[disk], sizeof(buffer[disk]));
+
 					offset = 0;
 				}
 				else
@@ -3594,6 +3606,8 @@ void user_io_poll()
 						FileReadAdv(&sd_image[disk], buffer[disk], sizeof(buffer[disk])))
 					{
 						buffer_lba[disk] = lba;
+						if (is_pdp2011() && disk == 1)
+							pdp2011_disk_read_fixup(disk, &sd_image[disk], lba * blksz, (uint8_t *)buffer[disk], sizeof(buffer[disk]));
 					}
 					else
 					{
