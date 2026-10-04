@@ -2139,6 +2139,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 
 	sd_image_cangrow[index] = (pre != 0);
 	sd_type[index] = SD_TYPE_DEFAULT ;
+	pdp2011_tape_detach(index);   // any mount or unmount ends a PDP2011 tape stream
 	if (len)
 	{
 		if (!ret)
@@ -2167,15 +2168,30 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 			}
 			else
 			{
-				// PDP2011 TM11 slot: TPC/E11 tapes are mounted from a converted
-				// SIMH copy, read-only (support/pdp2011/tapeconv.cpp).
-				static char pdp2011_tape[1024];
-				const char *mount_name = name;
-				if (is_pdp2011() && index == 3 && pdp2011_tape_prepare(name, pdp2011_tape, sizeof(pdp2011_tape)))
-					mount_name = pdp2011_tape;
+				// PDP2011 TM11 slot: a TPC/E11 tape is served to the core as a
+				// SIMH stream, read-only (support/pdp2011/tapeconv.cpp).
+				enum tape_format pdp2011_fmt = TAPE_UNKNOWN;
+				if (is_pdp2011() && index == 3)
+				{
+					char full[1024];
+					snprintf(full, sizeof(full), "%s", getFullPath(name));
+					pdp2011_fmt = tape_detect(full);
+					printf("PDP2011 tape %s: %s\n", name, tape_format_name(pdp2011_fmt));
+					pdp2011_tape_attach(index, full, pdp2011_fmt);
+				}
 
-				writable = (mount_name == name) ? FileCanWrite(name) : 0;
-				ret = FileOpenEx(&sd_image[index], mount_name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
+				writable = pdp2011_tape_streaming(index) ? 0 : FileCanWrite(name);
+				ret = FileOpenEx(&sd_image[index], name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
+				if (pdp2011_tape_streaming(index))
+				{
+					if (!ret) pdp2011_tape_detach(index);
+					else
+					{
+						char msg[64];
+						snprintf(msg, sizeof(msg), "%s tape: served\nas SIMH (read-only)", tape_format_name(pdp2011_fmt));
+						InfoMessage(msg);
+					}
+				}
 				if (ret && len > 4) {
 					const char *core_name = user_io_get_core_name();
 					const char *orig_core_name = user_io_get_core_name(1);
@@ -3471,6 +3487,13 @@ void user_io_poll()
 						cdi_read_cd(buffer[disk], lba, buf_n);
 						done = 1;
 						buffer_lba[disk] = lba;
+					}
+					else if (pdp2011_tape_streaming(disk) && sd_image[disk].size)
+					{
+						// PDP2011: TPC/E11 tape assembled into SIMH blocks on the fly
+						diskled_on();
+						done = pdp2011_tape_read(disk, lba * blksz, (uint8_t *)buffer[disk], sizeof(buffer[disk]));
+						if (done) buffer_lba[disk] = lba;
 					}
 					else if (sd_image[disk].size)
 					{

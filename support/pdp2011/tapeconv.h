@@ -17,12 +17,15 @@ int tape_convert(const char *src, const char *dst, enum tape_format fmt);
 
 const char *tape_format_name(enum tape_format fmt);
 
-// Mount hook for the TM11 slot: if `name` (relative to the MiSTer root, as
-// user_io_file_mount gets it) is a TPC or E11 tape, convert it once into
-// games/PDP2011/.converted/ and return 1 with that path in `out`; the copy is
-// reused while the source's size and mtime are unchanged. Returns 0 to mount
-// `name` as is (SIMH, unrecognised, or the conversion failed). Never writes
-// the source.
-int pdp2011_tape_prepare(const char *name, char *out, size_t outlen);
+#include <stdint.h>
+
+// Streaming (support/pdp2011/PLAN-host-compat.md, 1): a TPC/E11 image in tape
+// slot `slot` is served to the core as a SIMH stream, block by block, with no
+// conversion and nothing written. attach() after the image is opened (any
+// other format just detaches); read() fills len bytes from virtual offset off.
+void pdp2011_tape_attach(int slot, const char *path, enum tape_format fmt);
+void pdp2011_tape_detach(int slot);
+int pdp2011_tape_streaming(int slot);
+int pdp2011_tape_read(int slot, uint64_t off, uint8_t *buf, uint32_t len);
 
 #endif
