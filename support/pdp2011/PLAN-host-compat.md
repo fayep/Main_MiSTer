@@ -1,6 +1,6 @@
 # MiSTer_pdp2011: host-side compatibility for images found in the wild
 
-Status (2026-10-04): 1 (streamed tapes) and 3 (TU58) done and hardware-tested on feature/tape-compat; 2 planned.
+Status (2026-10-04): 1 (streamed tapes), 2 (disk images) and 3 (TU58) done on feature/tape-compat.
 
 People will mount whatever images they find on the internet. Main (the
 PDP2011 edition) should make the common variants just work, so the core
@@ -45,32 +45,22 @@ other emulators, some archives) have zeros there. BRU then fails ("Manufacturer
 bad sector file is corrupt") and RSX/RT-11 init can misbehave. Some images are
 also short: the RSTS RP06 images here are 6 sectors short of 815*19*22*512.
 
-**Plan.** In the sector-read path (`UIO_SECTOR_RD` for the disk indexes):
-
-- **RL slot:** an image of exactly 5242880 (RL01) or 10485760 (RL02) bytes, or
-  those plus SIMH's 512-byte footer. When the core reads a block of the last
-  track (the last 20 blocks of 512 bytes = 40 RL sectors) and that block is
-  **all zero**, return the synthesized table instead:
-  - serial = CRC of the file name, as SIMH;
-  - 0, 0;
-  - 177777 fill.
-  
-  The block is never written to the file. Once the OS writes the last track,
-  the real data is returned as normal.
-- **RH slot** for RM-type drives: the same rule, keyed by geometry, once the
-  core reports the drive type. RP04/05/06 had no DEC 144 table, so nothing is
-  synthesized for them.
-- **Short images (decided with the user, 2026-10-04):** reads past EOF
-  return zeros, as now. A write past EOF on a disk slot **grows the file**
-  (zero-filled) up to the drive's nominal size, like SIMH.
-  - **Exception:** a write that lands only in the last-track bad-block-table
-    region never grows the file. The synthesized "no bad blocks" table stays
-    virtual, and the image keeps its size.
-  - Growth never exceeds the drive's nominal size; beyond that the write is
-    dropped, as today.
-
-Rule of thumb: **only ever synthesize where the image has nothing.** Any
-non-zero data on the last track is the OS's and is returned unchanged.
+**Done (2026-10-04, ac95047): support/pdp2011/diskcompat.cpp.**
+- **Hooks:** mount, write, read, and Main's read-ahead, for the PDP2011
+  disk slots 0 RK, 1 RL and 2 RH.
+- **RL bad-sector table:** the first 10 sectors of the last track. If they
+  hold nothing in the image (all zero, or past EOF), they read as SIMH's
+  empty table (serial, 0, 0, 177777...). Nothing is written. Real data
+  passes through, and an OS write there makes it recheck. Not done for RH:
+  RP04/05/06 had no DEC STD 144 table, and the core's RH is an RP06.
+- **Short images (decided with the user):** a write past EOF grows the
+  file, the filesystem zero-filling the gap, up to the nominal size: RK05;
+  RL01 or RL02 by current size; RP06 174423040. A write that lands only in
+  an RL's table area never grows a short image, and a write past the drive
+  is dropped.
+- **Host test:** 13 checks with stubbed file I/O.
+- **Companion:** pdp2011_blank_media.sh in the release makes proper blank
+  images, with the RL table.
 
 ## 3. TU58 DECtape II on the serial line (OSD: "Line 1 = TU58")
 
