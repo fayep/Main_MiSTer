@@ -3581,6 +3581,15 @@ void user_io_poll()
 						cdi_read_cd(buffer[disk], lba, buf_n);
 						buffer_lba[disk] = lba;
 					}
+					else if (pdp2011_tape_streaming(disk))
+					{
+						// read-ahead of a streamed PDP2011 tape must come from the
+						// stream too, not from the TPC/E11 file underneath
+						if (pdp2011_tape_read(disk, lba * blksz, (uint8_t *)buffer[disk], sizeof(buffer[disk])))
+							buffer_lba[disk] = lba;
+						else
+							buffer_lba[disk] = -1;
+					}
 					else if (FileSeek(&sd_image[disk], lba * blksz, SEEK_SET) &&
 						FileReadAdv(&sd_image[disk], buffer[disk], sizeof(buffer[disk])))
 					{
