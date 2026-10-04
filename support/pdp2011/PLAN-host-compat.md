@@ -1,6 +1,6 @@
 # MiSTer_pdp2011: host-side compatibility for images found in the wild
 
-Status (2026-10-04): 1 implemented and hardware-tested (feature/tape-compat); 3 built, under test; 2 planned.
+Status (2026-10-04): 1 (streamed tapes) and 3 (TU58) done and hardware-tested on feature/tape-compat; 2 planned.
 
 People will mount whatever images they find on the internet. Main (the
 PDP2011 edition) should make the common variants just work, so the core
@@ -15,24 +15,25 @@ of medium). Many kits are TPC (16-bit length, data, no trailing length):
 `rsts_v9_6_install.tap`, `cobol-81_v2_3.tap` and `cobol-11_v4_4.tap` all had
 to be converted by hand.
 
-**Plan.** In `user_io_file_mount()`, for the tape slot (index 3):
-
-- **Detect** the format by walking the whole file:
-  - **SIMH:** every leading length equals its trailing copy, ending exactly
-    at EOF or at FFFFFFFF;
-  - **TPC:** a chain of 16-bit lengths with data padded to even, ending
-    exactly at EOF;
-  - **E11:** like SIMH but odd records unpadded.
-  
-  If the file is ambiguous, prefer SIMH.
-- **If not SIMH:** convert to
-  `games/PDP2011/.converted/<name>.<size>-<mtime>.tap` (reused while the
-  source is unchanged) and mount that read-only. Show "TPC tape converted" on
-  the OSD info line.
-- **Never touch the original** file.
-
-Converter: the same logic as the Python used by hand (records and marks
-round-trip identical), in C++, streaming (tapes can be large).
+**Done (2026-10-04, b1e4e14): streamed, not converted.**
+- **Detection** on mount, slot 3, from the first records only: SIMH (lengths
+  match their trailers), then E11 (SIMH framing, an odd record unpadded),
+  then TPC (16-bit chain). E11 is tried before TPC because E11 data can pass
+  as a TPC chain. A full walk is only the fallback for odd files, e.g. a
+  SIMH tape with junk after its last record (the RSTS/E 10.1 kit), which is
+  served as SIMH.
+- **TPC/E11:** the original file is mounted read-only and the slot's sector
+  reads are assembled on the fly (`pdp2011_tape_read`).
+  - An index of records (virtual SIMH offset, source offset, length) is
+    built from headers only, as far as reads reach.
+  - Each block is header + data + pad + trailer; past the last record comes
+    an EOM marker (FFFFFFFF), which the TM11 reports as EOT.
+  - The core uses img_size only as "mounted", so the source size is
+    reported.
+- **History:** a first version converted into games/PDP2011/.converted at
+  mount. Walking 21 MB before mounting let the PDP-11 boot before the tape
+  was there.
+- **Host test:** `tapeconv --stream src dst`.
 
 ## 2. Disks: an empty DEC STD 144 bad-block table where the image has none
 
