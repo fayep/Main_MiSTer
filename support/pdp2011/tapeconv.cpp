@@ -73,10 +73,42 @@ static int is_tpc(FILE *f)
 	return recs > 0 && pos == n;
 }
 
+// Quick check: the first few records parse as SIMH (lengths match their
+// trailers). Real TPC/E11 images fail this at once (see below), so a SIMH
+// tape is recognised without reading the whole file; the full walk is only
+// needed for everything else. Keeps the mount instant: the core may already
+// be booting from the tape.
+static int simh_quick(FILE *f)
+{
+	long n = fsize(f), pos = 0;
+	uint8_t h[4], t[4];
+	int recs = 0, marks = 0;
+	fseek(f, 0, SEEK_SET);
+	while (pos < n && recs < 8 && marks < 16)
+	{
+		if (pos + 4 > n || !rd(f, h, 4)) break;
+		uint32_t len = le32(h);
+		pos += 4;
+		if (len == 0) { marks++; continue; }
+		if (len == 0xFFFFFFFF) break;
+		uint32_t l = len & 0x00FFFFFF;
+		long skip = l + (l & 1);
+		if (pos + skip + 4 > n) return 0;
+		fseek(f, skip, SEEK_CUR); pos += skip;
+		if (!rd(f, t, 4) || le32(t) != len) return 0;
+		pos += 4; recs++;
+	}
+	// (An E11 image is identical to SIMH until its first odd-length record;
+	// one whose first 8 records are even is taken as SIMH here. Rare: real
+	// kits use 512-byte blocks and 80-byte labels.)
+	return recs > 0;
+}
+
 enum tape_format tape_detect(const char *path)
 {
 	FILE *f = fopen(path, "rb");
 	if (!f) return TAPE_UNKNOWN;
+	if (simh_quick(f)) { fclose(f); return TAPE_SIMH; }
 	enum tape_format r = TAPE_UNKNOWN;
 	int clean, recs = simh_walk(f, 1, &clean), clean_e11;
 	if (recs && clean) r = TAPE_SIMH;
@@ -188,7 +220,8 @@ int pdp2011_tape_prepare(const char *name, char *out, size_t outlen)
 
 	char dst[1024];
 	snprintf(dst, sizeof(dst), "%s", getFullPath(out));
-	if (tape_detect(dst) == TAPE_SIMH) return 1;    // converted earlier
+	struct stat dt;
+	if (!stat(dst, &dt) && dt.st_size > 0) return 1;   // converted earlier (name carries the source's size and mtime)
 
 	FileCreatePath(CONVERTED_DIR);
 	char tmp[1040];
