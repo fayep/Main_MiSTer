@@ -1,6 +1,6 @@
 # MiSTer_pdp2011: host-side compatibility for images found in the wild
 
-Status (2026-10-04): 1 implemented and hardware-tested (feature/tape-compat); 2 and 3 planned.
+Status (2026-10-04): 1 implemented and hardware-tested (feature/tape-compat); 3 built, under test; 2 planned.
 
 People will mount whatever images they find on the internet. Main (the
 PDP2011 edition) should make the common variants just work, so the core
@@ -71,27 +71,41 @@ also short: the RSTS RP06 images here are 6 sectors short of 815*19*22*512.
 Rule of thumb: **only ever synthesize where the image has nothing.** Any
 non-zero data on the last track is the OS's and is returned unchanged.
 
-## 3. TU58 DECtape II on the serial line (OSD: "Serial: TU58")
+## 3. TU58 DECtape II on the serial line (OSD: "Line 1 = TU58")
 
 **Goal (user).** One of the serial options attaches a TU58 emulator to the
 serial line automatically.
 
-**Wiring.** The core has one UART (Linux `/dev/ttyS1`).
-- With the console on the virtual VT100, KL11 line 1 (176500, vector 300)
-  goes to the UART. That is the standard TU58 address: RT-11 `DD:`, RSX
-  `DD:`, XXDP `DD`.
-- A new UART mode, "TU58", in the `uartmode` scheme (`/sbin/uartmode N`,
-  `GetUARTbaud`) starts a TU58 emulator on `/dev/ttyS1` at the line speed
-  (TU58: 38400 typical; RSP is speed-agnostic).
-- **Emulator:** tu58fs (Jörg Hoppe), or a small C emulator built into Main.
-  Either way it must speak RSP and MRSP (boot ROMs use MRSP).
-- **Cartridges:** `games/PDP2011/tu58/` (default `dd0.dsk`, `dd1.dsk`, 256 KB
-  each, created on first use), selectable from the OSD later.
-- **Constraint:** the serial console and TU58 share the one UART, so TU58
-  needs the VT console. The OSD should say so, or force VT when TU58 is
-  picked.
-- **Testing:** our pdp_harness also uses the UART, so tests must drive the
-  VT console (keyboard) or a second channel. Plan that before building.
+**Wiring (built 2026-10-04).**
+- **Core** (PDP2011_MiSTer `feature/serial-lineclock`): OSD "Line 1 (176500):
+  Serial port / TU58 DECtape II" (status bit 17). It is hidden when Console =
+  Serial, because only with the VT console does line 1 (176500, vector 300,
+  the standard TU58 address) reach the UART. The core routes nothing
+  differently: the bit is for Main.
+- **Main** (`support/pdp2011/tu58.cpp`): every 0.5 s, if Console = VT and
+  Line 1 = TU58, run `tu58fs` on /dev/ttyS1; otherwise, or when another core
+  loads, stop it.
+  - Files are in `games/PDP2011/tu58/`: the `tu58fs` program, and the
+    cartridges `dd0.dsk` and `dd1.dsk`, created as empty RT-11 tapes if
+    missing. The log is /tmp/tu58fs.log.
+  - Main re-execs itself on every core load, so it keeps /tmp/tu58fs.pid and
+    adopts or stops a leftover emulator.
+  - It refuses to start, with an OSD message, if Main's own UART mode is not
+    None, since that also uses ttyS1.
+- **tu58fs** (`~/Source/tu58fs`, branch `mister-sigterm`): SIGTERM/SIGINT now
+  exit like `Q`, saving changed cartridges. Before this, a kill lost writes
+  made within the 3 s sync timeout.
+
+**Speeds.** KL11 lines 0 and 1 run at 19200 baud (`kl0_bps` and `kl1_bps` in
+mister_top; the divisor is 186 x 14 samples at 50 MHz = 19201 baud). The
+core's config string declares `UART19200`, so Main sets ttyS1 to 19200.
+`tu58fs -b 19200` matches both.
+
+**Testing.** pdp_harness holds ttyS1 and must not run while the TU58 is
+attached: two readers split the bytes. That is the likely cause of the 2
+October XXDP `DIR DD0:` hang. The console is then the VT, so tests type
+through a virtual uinput keyboard (`claude_vtype.py`) and read the screen
+with screenshots.
 
 ## Order
 

@@ -45,6 +45,7 @@
 #include "support.h"
 #include "support/pdp2011/panel.h"
 #include "support/pdp2011/tapeconv.h"
+#include "support/pdp2011/tu58.h"
 
 static char core_path[1024] = {};
 static char rbf_path[1024] = {};
@@ -3252,6 +3253,9 @@ void user_io_poll()
 
 	if (is_pdp2011())
 		pdp2011_odt_poll();
+
+	// Runs for every core so that loading another one stops the emulator.
+	pdp2011_tu58_poll(is_pdp2011());
 
 	// sd card emulation
 	if (is_x86() || is_pcxt())
