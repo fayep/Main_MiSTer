@@ -44,6 +44,7 @@
 #include "scaler.h"
 #include "support.h"
 #include "support/pdp2011/panel.h"
+#include "support/pdp2011/tapeconv.h"
 
 static char core_path[1024] = {};
 static char rbf_path[1024] = {};
@@ -2165,8 +2166,15 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 			}
 			else
 			{
-				writable = FileCanWrite(name);
-				ret = FileOpenEx(&sd_image[index], name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
+				// PDP2011 TM11 slot: TPC/E11 tapes are mounted from a converted
+				// SIMH copy, read-only (support/pdp2011/tapeconv.cpp).
+				static char pdp2011_tape[1024];
+				const char *mount_name = name;
+				if (is_pdp2011() && index == 3 && pdp2011_tape_prepare(name, pdp2011_tape, sizeof(pdp2011_tape)))
+					mount_name = pdp2011_tape;
+
+				writable = (mount_name == name) ? FileCanWrite(name) : 0;
+				ret = FileOpenEx(&sd_image[index], mount_name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
 				if (ret && len > 4) {
 					const char *core_name = user_io_get_core_name();
 					const char *orig_core_name = user_io_get_core_name(1);
