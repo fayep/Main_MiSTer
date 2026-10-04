@@ -197,3 +197,19 @@ void pdp2011_tu58_poll(int active)
 	if (want && tu58_pid <= 0 && (!next_start || CheckTimer(next_start))) tu58_start();
 	else if (!want && tu58_pid > 0) tu58_stop();
 }
+
+void pdp2011_tu58_before_restart(const char *rbf_path)
+{
+	if (rbf_path && strcasestr(rbf_path, "PDP2011")) return;   // the next Main adopts it
+
+	if (!checked_pidfile)
+	{
+		// never polled in this Main: an emulator may still be running from before
+		FILE *f = fopen(TU58_PID, "r");
+		int pid = 0;
+		if (f) { if (fscanf(f, "%d", &pid) != 1) pid = 0; fclose(f); }
+		if (pid > 0 && kill(pid, 0) == 0 && is_tu58fs(pid)) { tu58_pid = pid; adopted = 1; }
+		checked_pidfile = 1;
+	}
+	if (tu58_pid > 0 && alive()) tu58_stop();
+}

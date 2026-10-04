@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+#include "support/pdp2011/tu58.h"
 #include "fpga_io.h"
 #include "file_io.h"
 #include "input.h"
@@ -626,6 +627,7 @@ void app_restart(const char *path, const char *xml, const char *exe)
 	input_uinp_destroy();
 
 	offload_stop();
+	pdp2011_tu58_before_restart(path);
 
 	const char *appname = exe ? exe : getappname();
 	printf("restarting to %s\n", appname);
