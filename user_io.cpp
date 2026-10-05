@@ -36,7 +36,7 @@
 #include "ide_cdrom.h"
 #include "support/minimig/akiko_cd32.h"
 #include "support/minimig/cdtv_cd.h"
-#include "support/xu/xu.h"
+#include "support/pdp2011/xu_net.h"
 #ifdef PROFILING
 #include "profiling.h"
 #endif
@@ -245,8 +245,7 @@ char is_x86()
 	return (is_x86_type == 1);
 }
 
-/* Ordinary CORE_TYPE_8BIT core, cached the same way is_x86() is -- see
- * support/xu/xu.cpp's xu_poll()/xu_stop(), the only caller. */
+/* Ordinary CORE_TYPE_8BIT core, cached the same way is_x86() is. */
 static int is_pdp2011_type = 0;
 char is_pdp2011()
 {
@@ -1432,10 +1431,9 @@ void user_io_init(const char *path, const char *xml)
 	// path below restarts them if the card is enabled.
 	a2065_stop();
 
-	// Same idea for XU: stop it on any core switch. Unlike A2065, XU has no
-	// dedicated boot-path start call -- xu_poll() (below) restarts itself
-	// once it sees the PDP2011 core loaded and enabled.
-	xu_stop();
+	// Same idea for the PDP2011 XU (DEUNA) host networking: stop it on any
+	// core switch; pdp2011_xu_poll() (below) starts it again for PDP2011.
+	pdp2011_xu_stop();
 
 	// we need to set the directory to where the XML file (MRA) is
 	// not the RBF. The RBF will be in arcade, which the user shouldn't
@@ -3256,13 +3254,9 @@ void user_io_poll()
 		a2065_poll();
 	}
 
-	// Matches a2065_poll()'s own is_minimig() gate above -- is_pdp2011()
-	// is a cached check (user_io.cpp), not a live strcasecmp every call.
-	// xu_stop() still runs unconditionally from user_io_init() on every
-	// core switch (matching a2065_stop()), so gating the call here loses
-	// no cleanup: xu_poll() simply never runs while a different core is
-	// loaded, same as a2065_poll() never runs outside is_minimig().
-	if (is_pdp2011()) xu_poll();
+	// XU (DEUNA) host networking; pdp2011_xu_stop() runs from user_io_init()
+	// on every core switch, so gating the poll here loses no cleanup.
+	if (is_pdp2011()) pdp2011_xu_poll();
 
 	if (core_type == CORE_TYPE_8BIT && !is_menu())
 	{
