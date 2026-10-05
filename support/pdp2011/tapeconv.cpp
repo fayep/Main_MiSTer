@@ -152,7 +152,7 @@ static int e11_quick(FILE *f)
 
 enum tape_format tape_detect(const char *path)
 {
-	FILE *f = fopen(path, "rb");
+	FILE *f = fopen(path, "rbe");
 	if (!f) return TAPE_UNKNOWN;
 	if (simh_quick(f)) { fclose(f); return TAPE_SIMH; }
 	// E11 before TPC: E11 data read as 16-bit lengths can look like a valid
@@ -198,9 +198,9 @@ static int put_rec(FILE *o, const uint8_t *data, uint32_t len)
 int tape_convert(const char *src, const char *dst, enum tape_format fmt)
 {
 	if (fmt != TAPE_TPC && fmt != TAPE_E11) return 0;
-	FILE *f = fopen(src, "rb");
+	FILE *f = fopen(src, "rbe");
 	if (!f) return 0;
-	FILE *o = fopen(dst, "wb");
+	FILE *o = fopen(dst, "wbe");
 	if (!o) { fclose(f); return 0; }
 	long n = fsize(f), pos = 0;
 	uint8_t *buf = (uint8_t *)malloc(0x10000 + 2);
@@ -316,7 +316,7 @@ void pdp2011_tape_attach(int slot, const char *path, enum tape_format fmt)
 	if (t.f) fclose(t.f);
 	t = tape_stream();
 	if (fmt != TAPE_TPC && fmt != TAPE_E11) return;
-	t.f = fopen(path, "rb");
+	t.f = fopen(path, "rbe");
 	if (!t.f) return;
 	t.fmt = fmt;
 	t.fsz = fsize(t.f);
