@@ -76,6 +76,13 @@ static uint64_t host_word = 0;
 static inline uint64_t rd64(uint32_t off) { return *(volatile uint64_t *)(mb + off); }
 static inline void wr64(uint32_t off, uint64_t v) { *(volatile uint64_t *)(mb + off) = v; }
 
+// Ring pointers are 32-bit counters in the low half of their word, as the
+// bridge keeps them. Never use the upper half: a word nobody has written yet
+// holds whatever DDR3 powered up with, and one stray bit there makes the
+// ring look permanently full.
+static inline uint32_t rdptr(uint32_t off) { return (uint32_t)rd64(off); }
+static inline void wrptr(uint32_t off, uint32_t v) { wr64(off, (uint64_t)v); }
+
 static uint64_t mac_word(const uint8_t *m)
 {
 	uint64_t v = 0;
@@ -175,16 +182,16 @@ static int wanted(const uint8_t *f)
 
 static void deliver(const uint8_t *f, int len)
 {
-	uint64_t rxw = rd64(XN_RXWPTR_OFF);
-	uint64_t rxr = rd64(XN_RXRPTR_OFF);
-	if (rxw - rxr >= XN_RING) return;           // the guest is not keeping up: the wire drops it
+	uint32_t rxw = rdptr(XN_RXWPTR_OFF);
+	uint32_t rxr = rdptr(XN_RXRPTR_OFF);
+	if ((uint32_t)(rxw - rxr) >= XN_RING) return;           // the guest is not keeping up: the wire drops it
 	if (len > XN_MAXLEN) len = XN_MAXLEN;
 	uint32_t slot = XN_RXSLOT_OFF + XN_SLOT_SIZE * (uint32_t)(rxw % XN_RING);
 	memcpy((void *)(mb + slot + 8), f, len);
 	__sync_synchronize();
 	wr64(slot, (uint64_t)len);
 	__sync_synchronize();
-	wr64(XN_RXWPTR_OFF, rxw + 1);
+	wrptr(XN_RXWPTR_OFF, rxw + 1);
 }
 
 void pdp2011_xu_stop(void)
@@ -267,9 +274,9 @@ void pdp2011_xu_poll(void)
 	}
 
 	// transmit: everything the guest queued
-	uint64_t txw = rd64(XN_TXWPTR_OFF);
-	uint64_t txr = rd64(XN_TXRPTR_OFF);
-	if (txw - txr > XN_RING) txr = txw - XN_RING;
+	uint32_t txw = rdptr(XN_TXWPTR_OFF);
+	uint32_t txr = rdptr(XN_TXRPTR_OFF);
+	if ((uint32_t)(txw - txr) > XN_RING) txr = txw - XN_RING;
 	while (txr != txw)
 	{
 		uint32_t slot = XN_TXSLOT_OFF + XN_SLOT_SIZE * (uint32_t)(txr % XN_RING);
@@ -283,7 +290,7 @@ void pdp2011_xu_poll(void)
 		txr++;
 	}
 	__sync_synchronize();
-	wr64(XN_TXRPTR_OFF, txr);
+	wrptr(XN_TXRPTR_OFF, txr);
 
 	// receive: drain the socket every pass (a NIC that is not keeping up drops
 	// frames, it does not queue them for later)
