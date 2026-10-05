@@ -180,11 +180,47 @@ static int wanted(const uint8_t *f)
 	return !memcmp(f, guest_mac, 6);
 }
 
+// Received frames wait in two queues across polls: unicast to the guest,
+// then broadcast/multicast. Unicast always goes into the ring first; the
+// rest only while the ring keeps XN_UNI_HEADROOM slots free for unicast
+// still to come, best effort (dropped when its queue is full). No
+// ethertype filtering: DECnet (60-03), LAT and MOP must get through.
+#define XN_UNIQ        64
+#define XN_OTHQ        32
+#define XN_UNI_HEADROOM 2
+
+struct xn_frame { uint16_t len; uint8_t buf[MAX_FRAME]; };
+struct xn_queue { int head, count, depth; struct xn_frame *f; };
+static struct xn_frame uni_buf[XN_UNIQ], oth_buf[XN_OTHQ];
+static struct xn_queue uniq = { 0, 0, XN_UNIQ, uni_buf }, othq = { 0, 0, XN_OTHQ, oth_buf };
+static unsigned long drops_uni = 0, drops_oth = 0;
+
+static int q_push(struct xn_queue *q, const uint8_t *f, int len)
+{
+	if (q->count == q->depth) return 0;
+	struct xn_frame *e = &q->f[(q->head + q->count) % q->depth];
+	e->len = (uint16_t)len;
+	memcpy(e->buf, f, len);
+	q->count++;
+	return 1;
+}
+
+static void q_clear(void)
+{
+	uniq.head = uniq.count = 0;
+	othq.head = othq.count = 0;
+}
+
+static uint32_t ring_used(void)
+{
+	return (uint32_t)(rdptr(XN_RXWPTR_OFF) - rdptr(XN_RXRPTR_OFF));
+}
+
 static void deliver(const uint8_t *f, int len)
 {
 	uint32_t rxw = rdptr(XN_RXWPTR_OFF);
 	uint32_t rxr = rdptr(XN_RXRPTR_OFF);
-	if ((uint32_t)(rxw - rxr) >= XN_RING) return;           // the guest is not keeping up: the wire drops it
+	if ((uint32_t)(rxw - rxr) >= XN_RING) return;
 	if (len > XN_MAXLEN) len = XN_MAXLEN;
 	uint32_t slot = XN_RXSLOT_OFF + XN_SLOT_SIZE * (uint32_t)(rxw % XN_RING);
 	memcpy((void *)(mb + slot + 8), f, len);
@@ -206,6 +242,7 @@ void pdp2011_xu_stop(void)
 	}
 	cur_net = NET_OFF;
 	guest_known = 0;
+	q_clear();
 }
 
 void pdp2011_xu_poll(void)
@@ -292,14 +329,32 @@ void pdp2011_xu_poll(void)
 	__sync_synchronize();
 	wrptr(XN_TXRPTR_OFF, txr);
 
-	// receive: drain the socket every pass (a NIC that is not keeping up drops
-	// frames, it does not queue them for later)
+	// receive: drain the socket every pass into the two queues
 	if (!link_open) return;
-	for (;;)
+	for (int n = 0; n < 256; n++)
 	{
 		int len = ethernet_recv_nb(frame, MAX_FRAME);
 		if (len <= 0) break;
 		if (len < 14 || (guest_mode & XN_MODE_LOOP) || !wanted(frame)) continue;
-		deliver(frame, len);
+		if (frame[0] & 1) { if (!q_push(&othq, frame, len)) drops_oth++; }
+		else if (!q_push(&uniq, frame, len)) drops_uni++;
 	}
+
+	// then the ring: unicast first, the rest into what unicast leaves
+	while (uniq.count && ring_used() < XN_RING)
+	{
+		struct xn_frame *e = &uniq.f[uniq.head];
+		deliver(e->buf, e->len);
+		uniq.head = (uniq.head + 1) % uniq.depth; uniq.count--;
+	}
+	while (othq.count && !uniq.count && ring_used() < XN_RING - XN_UNI_HEADROOM)
+	{
+		struct xn_frame *e = &othq.f[othq.head];
+		deliver(e->buf, e->len);
+		othq.head = (othq.head + 1) % othq.depth; othq.count--;
+	}
+
+	static uint32_t stats_t = 0;
+	if (!(++stats_t & 0xFFFF) && (drops_uni || drops_oth))
+		printf("[pdp2011-xu] receive queue drops: unicast %lu, broadcast/multicast %lu\n", drops_uni, drops_oth);
 }
