@@ -225,6 +225,15 @@ static void deliver(const uint8_t *f, int len)
 	if (len > XN_MAXLEN) len = XN_MAXLEN;
 	uint32_t slot = XN_RXSLOT_OFF + XN_SLOT_SIZE * (uint32_t)(rxw % XN_RING);
 	memcpy((void *)(mb + slot + 8), f, len);
+	// A frame off a wire is never under 60 bytes (without CRC), and guest
+	// drivers count shorter ones as errors (2.11BSD de: len < ETHERMIN).
+	// Frames from the MiSTer's own Linux over tap0 are not padded (a
+	// 42-byte ARP reply), so pad them here as the wire would.
+	if (len < 60)
+	{
+		memset((void *)(mb + slot + 8 + len), 0, 60 - len);
+		len = 60;
+	}
 	__sync_synchronize();
 	wr64(slot, (uint64_t)len);
 	__sync_synchronize();
