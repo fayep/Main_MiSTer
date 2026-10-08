@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "xu_net.h"
+#include "tapelib.h"
 #include "../../user_io.h"
 #include "../../shmem.h"
 
@@ -247,7 +248,7 @@ void pdp2011_xu_stop(void)
 
 void pdp2011_xu_poll(void)
 {
-	static uint8_t frame[MAX_FRAME];
+	static uint8_t frame[MAX_FRAME], reply[MAX_FRAME];
 
 	int net = (int)user_io_status_get("[27:25]");
 	if (net < NET_OFF || net > NET_TAP0) net = NET_OFF;
@@ -321,7 +322,9 @@ void pdp2011_xu_poll(void)
 		if (len >= 14 && len <= MAX_FRAME)
 		{
 			memcpy(frame, (const void *)(mb + slot + 8), len);
-			if (guest_mode & XN_MODE_LOOP) deliver(frame, len);
+			int rl = pdp2011_tapelib_frame(frame, len, reply);
+			if (rl > 0) { if (!q_push(&uniq, reply, rl)) drops_uni++; }   // the tape library (tapelib.h): never on the wire
+			else if (guest_mode & XN_MODE_LOOP) deliver(frame, len);
 			else if (link_open) ethernet_send(frame, len);
 		}
 		txr++;
@@ -330,8 +333,7 @@ void pdp2011_xu_poll(void)
 	wrptr(XN_TXRPTR_OFF, txr);
 
 	// receive: drain the socket every pass into the two queues
-	if (!link_open) return;
-	for (int n = 0; n < 256; n++)
+	for (int n = 0; link_open && n < 256; n++)
 	{
 		int len = ethernet_recv_nb(frame, MAX_FRAME);
 		if (len <= 0) break;
