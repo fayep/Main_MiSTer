@@ -169,15 +169,34 @@ static void open_link(int net)
 	printf("[pdp2011-xu] up on %s\n", iface);
 }
 
-// What the DEUNA would accept: its own address, broadcast and multicast
-// (the multicast list is not applied: all of them pass), or everything when
-// promiscuous. Our own transmissions seen again on a shared NIC are dropped.
+// Group addresses the guest gets without its multicast list: broadcast;
+// DEC's blocks AB-00-00 (MOP AB-00-00-01/02, DECnet Phase IV routers and end
+// nodes AB-00-00-03/04) and 09-00-2B (LAT and other DEC protocols); and
+// CF-00-00-00-00-00, loopback assistance (Ethernet loopback 90-00, DECnet
+// loop tests). The DEUNA's multicast list is not applied yet, so passing
+// every group frame flooded the guest with the LAN's mDNS, SSDP and IPv6
+// multicast.
+static int group_wanted(const uint8_t *f)
+{
+	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	if (!memcmp(f, bcast, 6)) return 1;
+	if (f[0] == 0xab && f[1] == 0x00 && f[2] == 0x00) return 1;
+	if (f[0] == 0x09 && f[1] == 0x00 && f[2] == 0x2b) return 1;
+	static const uint8_t loopassist[6] = { 0xcf, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	if (!memcmp(f, loopassist, 6)) return 1;
+	return 0;
+}
+
+// What the DEUNA would accept: its own address, broadcast, the multicast it
+// would want (see group_wanted; all of it when the guest enables all
+// multicast), or everything when promiscuous. Our own transmissions seen
+// again on a shared NIC are dropped.
 static int wanted(const uint8_t *f)
 {
 	if (!guest_known) return 0;
 	if (!memcmp(f + 6, guest_mac, 6)) return 0;
 	if (guest_mode & XN_MODE_PROM) return 1;
-	if (f[0] & 1) return 1;
+	if (f[0] & 1) return (guest_mode & XN_MODE_ENAL) || group_wanted(f);
 	return !memcmp(f, guest_mac, 6);
 }
 
