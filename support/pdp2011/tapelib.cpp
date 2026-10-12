@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 #include "tapelib.h"
 #include "tapeconv.h"
@@ -20,36 +21,136 @@
 #define TL_TAPE     3           // the TM11's image slot
 #define TL_MAXNAMES 256
 #define TL_DATAMAX  1400
+#define TL_PATHMAX  128         // longest path a request may carry
+#define TL_DEPTH    4           // folders below the home directory
 
 static const uint8_t lib_mac[6] = { 0x02, 0x50, 0x44, 0x50, 0x54, 0x4C };
+
+// one path component: letters, digits, . _ - $ +, not hidden
+static int is_plain(const char *n, int len)
+{
+	if (len < 1 || len > 64 || n[0] == '.') return 0;
+	for (int i = 0; i < len; i++)
+		if (!((n[i] >= 'A' && n[i] <= 'Z') || (n[i] >= 'a' && n[i] <= 'z') || (n[i] >= '0' && n[i] <= '9') ||
+		      n[i] == '.' || n[i] == '_' || n[i] == '-' || n[i] == '$' || n[i] == '+'))
+			return 0;
+	return 1;
+}
 
 static int is_tape_name(const char *n)
 {
 	int len = strlen(n);
-	if (len < 5 || len > 64) return 0;
-	if (strcasecmp(n + len - 4, ".tap") && strcasecmp(n + len - 4, ".tpc")) return 0;
-	for (const char *p = n; *p; p++)
-		if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
-		      *p == '.' || *p == '_' || *p == '-' || *p == '$'))
-			return 0;
-	return n[0] != '.';
+	if (len < 5 || !is_plain(n, len)) return 0;
+	return !strcasecmp(n + len - 4, ".tap") || !strcasecmp(n + len - 4, ".tpc");
+}
+
+// a folder the library shows: plain, not _-prefixed (_Old, _Scratch)
+static int is_shown_dir(const char *n)
+{
+	return n[0] != '_' && is_plain(n, strlen(n));
+}
+
+static int is_dir(const char *rel)
+{
+	struct stat64 *st = getPathStat(rel);
+	return st && S_ISDIR(st->st_mode);
 }
 
 static int name_cmp(const void *a, const void *b)
 {
-	return strcasecmp(*(char *const *)a, *(char *const *)b);
+	const char *x = *(char *const *)a, *y = *(char *const *)b;
+	int dx = x[strlen(x) - 1] == '/', dy = y[strlen(y) - 1] == '/';
+	if (dx != dy) return dy - dx;           // folders first
+	return strcasecmp(x, y);
 }
 
-// the library's tapes, sorted; returns how many (names malloc'd)
-static int scan(char **names)
+// any tape in rel (a path under /media/fat) or the folders below it
+static int has_tapes(const char *rel, int depth)
 {
-	const char *home = getFullPath(HomeDir());
-	DIR *d = opendir(home);
+	char full[1100], sub[1100];
+	snprintf(full, sizeof(full), "%s", getFullPath(rel));
+	DIR *d = opendir(full);
+	if (!d) return 0;
+	struct dirent *e;
+	int found = 0;
+	while (!found && (e = readdir(d)))
+	{
+		if (is_tape_name(e->d_name)) found = 1;
+		else if (depth < TL_DEPTH && is_shown_dir(e->d_name))
+		{
+			snprintf(sub, sizeof(sub), "%s/%s", rel, e->d_name);
+			found = is_dir(sub) && has_tapes(sub, depth + 1);
+		}
+	}
+	closedir(d);
+	return found;
+}
+
+// rel_in ("RSTS/V9.6/x.tap", any case, '/'-separated) -> out, the real path
+// under /media/fat ("games/PDP2011/RSTS/V9.6/x.tap"), matching each component
+// case-insensitively; want_dir: the last component must be a folder (else a
+// tape). Returns 1 when found.
+static int resolve(const char *rel_in, char *out, int outlen, int want_dir)
+{
+	char full[1100];
+	int depth = 0;
+	snprintf(out, outlen, "%s", HomeDir());
+	const char *p = rel_in;
+	while (*p == '/') p++;
+	if (!*p) return want_dir;
+	while (*p)
+	{
+		const char *s = strchr(p, '/');
+		int len = s ? s - p : strlen(p);
+		const char *next = s ? s + 1 : p + len;
+		while (*next == '/') next++;
+		int last = !*next;
+		if (!is_plain(p, len) || ++depth > TL_DEPTH + 1) return 0;
+		snprintf(full, sizeof(full), "%s", getFullPath(out));
+		DIR *d = opendir(full);
+		if (!d) return 0;
+		struct dirent *e;
+		int hit = 0;
+		while ((e = readdir(d)))
+			if ((int)strlen(e->d_name) == len && !strncasecmp(e->d_name, p, len))
+			{
+				int l = strlen(out);
+				snprintf(out + l, outlen - l, "/%s", e->d_name);
+				hit = 1;
+				break;
+			}
+		closedir(d);
+		if (!hit) return 0;
+		if (!last || want_dir) { if (!is_dir(out)) return 0; }
+		else if (is_dir(out) || !is_tape_name(strrchr(out, '/') + 1)) return 0;
+		p = next;
+	}
+	return 1;
+}
+
+// a folder's entries, sorted, folders first as "NAME/"; returns how many (names malloc'd)
+static int scan(const char *rel, char **names)
+{
+	char full[1100], sub[1100];
+	snprintf(full, sizeof(full), "%s", getFullPath(rel));
+	DIR *d = opendir(full);
 	int n = 0;
 	if (!d) return 0;
 	struct dirent *e;
 	while ((e = readdir(d)) && n < TL_MAXNAMES)
+	{
 		if (is_tape_name(e->d_name)) names[n++] = strdup(e->d_name);
+		else if (is_shown_dir(e->d_name))
+		{
+			snprintf(sub, sizeof(sub), "%s/%s", rel, e->d_name);
+			if (is_dir(sub) && has_tapes(sub, 1))
+			{
+				int l = strlen(e->d_name) + 2;
+				names[n] = (char *)malloc(l);
+				snprintf(names[n++], l, "%s/", e->d_name);
+			}
+		}
+	}
 	closedir(d);
 	qsort(names, n, sizeof(char *), name_cmp);
 	return n;
@@ -58,11 +159,13 @@ static int scan(char **names)
 static void put16(uint8_t *p, int v) { p[0] = (v >> 8) & 0xFF; p[1] = v & 0xFF; }
 static int get16(const uint8_t *p) { return (p[0] << 8) | p[1]; }
 
-// "name\0format" for what the drive holds now
+// "path\0format" for what the drive holds now, the path relative to the library
 static int describe(uint8_t *d)
 {
-	const char *n = get_image_name(TL_TAPE);
-	if (!n) return -1;
+	if (!get_image_name(TL_TAPE)) return -1;
+	const char *n = get_image(TL_TAPE)->name, *home = HomeDir();
+	int hl = strlen(home);
+	if (!strncmp(n, home, hl) && n[hl] == '/') n += hl + 1;
 	int len = snprintf((char *)d, 200, "%s", n) + 1;
 	const char *fmt = pdp2011_tape_streaming(TL_TAPE) ? "TPC/E11, streamed as SIMH (read-only)" : "SIMH";
 	len += snprintf((char *)d + len, 200, "%s", fmt);
@@ -91,24 +194,21 @@ int pdp2011_tapelib_frame(const uint8_t *f, int len, uint8_t *reply)
 
 	switch (op)
 	{
-	case 1:     // load
+	case 1:     // load: data = the tape's path in the library
 	{
-		char want[72], *names[TL_MAXNAMES], path[1100];
-		if (dlen < 1 || dlen > 64) { r[5] = TL_BADNAME; break; }
+		char want[TL_PATHMAX + 1], path[1100];
+		if (dlen < 1 || dlen > TL_PATHMAX) { r[5] = TL_BADNAME; break; }
 		memcpy(want, q + 10, dlen);
 		want[dlen] = 0;
-		if (!is_tape_name(want)) { r[5] = TL_BADNAME; break; }
-		int n = scan(names), hit = -1;
-		for (int i = 0; i < n; i++) if (!strcasecmp(names[i], want)) hit = i;
-		if (hit < 0) r[5] = TL_NOFILE;
+		const char *base = strrchr(want, '/');
+		if (!is_tape_name(base ? base + 1 : want)) { r[5] = TL_BADNAME; break; }
+		if (!resolve(want, path, sizeof(path), 0)) r[5] = TL_NOFILE;
 		else
 		{
-			snprintf(path, sizeof(path), "%s/%s", HomeDir(), names[hit]);
 			printf("[pdp2011-tapelib] load %s\n", path);
 			if (!user_io_file_mount(path, TL_TAPE)) r[5] = TL_FAILED;
 			else rlen = describe(d);
 		}
-		for (int i = 0; i < n; i++) free(names[i]);
 		if (rlen < 0) { rlen = 0; r[5] = TL_FAILED; }
 		break;
 	}
@@ -116,10 +216,16 @@ int pdp2011_tapelib_frame(const uint8_t *f, int len, uint8_t *reply)
 		printf("[pdp2011-tapelib] unload\n");
 		user_io_file_mount("", TL_TAPE);
 		break;
-	case 3:     // directory, from an index
+	case 3:     // directory: data = first index (2), then the folder's path (none: the top)
 	{
-		char *names[TL_MAXNAMES];
-		int n = scan(names), first = dlen >= 2 ? get16(q + 10) : 0, here = 0;
+		char *names[TL_MAXNAMES], want[TL_PATHMAX + 1], rel[1100];
+		int first = dlen >= 2 ? get16(q + 10) : 0, plen = dlen - 2, here = 0;
+		if (plen > TL_PATHMAX) { r[5] = TL_BADNAME; break; }
+		if (plen < 0) plen = 0;
+		memcpy(want, q + 12, plen);
+		want[plen] = 0;
+		if (!resolve(want, rel, sizeof(rel), 1)) { r[5] = TL_NODIR; break; }
+		int n = scan(rel, names);
 		rlen = 4;
 		for (int i = first; i < n; i++)
 		{
