@@ -11,7 +11,8 @@
 //
 // Payload (after the 14-byte header), multi-byte fields big-endian:
 //   0  "TLIB"
-//   4  op: 1 load (data = the tape's path), 2 unload, 3 directory (data =
+//   4  op: 1 load (data = the tape's path; a bare name is looked for in
+//      every listed folder and loaded if found once), 2 unload, 3 directory (data =
 //      2-byte first index, then the folder's path; none = the top),
 //      4 status; the reply has op | 0x80
 //   5  reply status (TL_*)
@@ -32,6 +33,7 @@
 #define TL_BADOP    4
 #define TL_EMPTY    5   // status: no tape mounted
 #define TL_NODIR    6   // directory: no such folder
+#define TL_AMBIG    7   // load: a bare name found in more than one folder; data = their paths
 
 // A frame the guest sent: if it is a library request, build the reply in
 // reply (at least 1514 bytes) and return its length; otherwise return 0.

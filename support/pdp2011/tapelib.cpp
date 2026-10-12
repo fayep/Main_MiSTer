@@ -128,6 +128,28 @@ static int resolve(const char *rel_in, char *out, int outlen, int want_dir)
 	return 1;
 }
 
+// a bare tape name anywhere in the library: the top and the listed folders
+// below it ('.'/'_' folders are not searched). Adds each match's real path
+// under /media/fat to found (malloc'd); returns the new count.
+static int find_tape(const char *rel, const char *want, char **found, int n, int depth)
+{
+	char full[1100], sub[1100];
+	snprintf(full, sizeof(full), "%s", getFullPath(rel));
+	DIR *d = opendir(full);
+	if (!d) return n;
+	struct dirent *e;
+	while ((e = readdir(d)) && n < TL_MAXNAMES)
+	{
+		snprintf(sub, sizeof(sub), "%s/%s", rel, e->d_name);
+		if (is_tape_name(e->d_name) && !strcasecmp(e->d_name, want) && !is_dir(sub))
+			found[n++] = strdup(sub);
+		else if (depth < TL_DEPTH && is_shown_dir(e->d_name) && is_dir(sub))
+			n = find_tape(sub, want, found, n, depth + 1);
+	}
+	closedir(d);
+	return n;
+}
+
 // a folder's entries, sorted, folders first as "NAME/"; returns how many (names malloc'd)
 static int scan(const char *rel, char **names)
 {
@@ -207,7 +229,29 @@ int pdp2011_tapelib_frame(const uint8_t *f, int len, uint8_t *reply)
 		want[dlen] = 0;
 		const char *base = strrchr(want, '/');
 		if (!is_tape_name(base ? base + 1 : want)) { r[5] = TL_BADNAME; break; }
-		if (!resolve(want, path, sizeof(path), 0)) r[5] = TL_NOFILE;
+		int found = resolve(want, path, sizeof(path), 0);
+		if (!found && !base)
+		{
+			// a bare name: wherever it is in the library, if only once
+			char *hits[TL_MAXNAMES];
+			int n = find_tape(HomeDir(), want, hits, 0, 0), hl = strlen(HomeDir());
+			qsort(hits, n, sizeof(char *), name_cmp);
+			if (n == 1) { snprintf(path, sizeof(path), "%s", hits[0]); found = 1; }
+			else if (n > 1)
+			{
+				r[5] = TL_AMBIG;        // the matching paths, NUL-separated
+				for (int i = 0; i < n; i++)
+				{
+					int l = strlen(hits[i] + hl + 1) + 1;
+					if (rlen + l > TL_DATAMAX) break;
+					memcpy(d + rlen, hits[i] + hl + 1, l);
+					rlen += l;
+				}
+			}
+			for (int i = 0; i < n; i++) free(hits[i]);
+			if (n > 1) break;
+		}
+		if (!found) r[5] = TL_NOFILE;
 		else
 		{
 			printf("[pdp2011-tapelib] load %s\n", path);
