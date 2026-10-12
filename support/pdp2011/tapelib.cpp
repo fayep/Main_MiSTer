@@ -159,13 +159,18 @@ static int scan(const char *rel, char **names)
 static void put16(uint8_t *p, int v) { p[0] = (v >> 8) & 0xFF; p[1] = v & 0xFF; }
 static int get16(const uint8_t *p) { return (p[0] << 8) | p[1]; }
 
-// "path\0format" for what the drive holds now, the path relative to the library
+// the path (relative to the library) of the tape TLOAD last put on the drive:
+// Main keeps only the file name of a mounted image
+static char loaded[TL_PATHMAX + 64];
+
+// "path\0format" for what the drive holds now: the library path when TLOAD
+// loaded it, else (mounted from the OSD) the file name
 static int describe(uint8_t *d)
 {
-	if (!get_image_name(TL_TAPE)) return -1;
-	const char *n = get_image(TL_TAPE)->name, *home = HomeDir();
-	int hl = strlen(home);
-	if (!strncmp(n, home, hl) && n[hl] == '/') n += hl + 1;
+	const char *n = get_image_name(TL_TAPE);
+	if (!n) return -1;
+	const char *b = strrchr(loaded, '/');
+	if (loaded[0] && !strcmp(b ? b + 1 : loaded, n)) n = loaded;
 	int len = snprintf((char *)d, 200, "%s", n) + 1;
 	const char *fmt = pdp2011_tape_streaming(TL_TAPE) ? "TPC/E11, streamed as SIMH (read-only)" : "SIMH";
 	len += snprintf((char *)d + len, 200, "%s", fmt);
@@ -206,7 +211,9 @@ int pdp2011_tapelib_frame(const uint8_t *f, int len, uint8_t *reply)
 		else
 		{
 			printf("[pdp2011-tapelib] load %s\n", path);
-			if (!user_io_file_mount(path, TL_TAPE)) r[5] = TL_FAILED;
+			int hl = strlen(HomeDir());
+			snprintf(loaded, sizeof(loaded), "%s", path + hl + 1);
+			if (!user_io_file_mount(path, TL_TAPE)) { r[5] = TL_FAILED; loaded[0] = 0; }
 			else rlen = describe(d);
 		}
 		if (rlen < 0) { rlen = 0; r[5] = TL_FAILED; }
