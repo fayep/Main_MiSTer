@@ -16,7 +16,13 @@
 //    and -- the user's rule -- a write that lands only in that area does not
 //    grow a short image. Any real data there is the OS's and passes through.
 //
-// 3. The drive behind an RL or RH image. The extent of the pack -- its file
+// 3. SIMH's footer. SIMH 4 appends 512 bytes to the images it creates: "simh",
+//    the drive type ("RL01", "RM03", ...), sector size and count, a CRC-32,
+//    numbers big-endian; the data is sector count x size before it. A valid
+//    footer is hidden (the image's size becomes its data size, so it is never
+//    read or written as pack data) and its drive type decides the drive.
+//
+// 4. The drive behind an RL or RH image. The extent of the pack -- its file
 //    system's (fssize.cpp: RSTS/E, RT-11, ODS-1, as SIMH's autosize), else the
 //    file's size -- picks the drive: with a file system the smallest that holds
 //    it (RL01 or RL02; RM03, RP04, RM80, RP06, RM05 or RP07), without one an RH
@@ -29,6 +35,7 @@
 #include <string.h>
 #include "diskcompat.h"
 #include "fssize.h"
+#include "../../lib/miniz/miniz.h"
 
 #define RK05_SIZE  2494464ULL       // 203 cyl * 2 surfaces * 12 * 512
 #define RL01_SIZE  5242880ULL       // 256 cyl * 2 * 40 * 256
@@ -74,14 +81,53 @@ static uint64_t bbt_start(fileTYPE *f)
 	return nominal(1, f->size) - RL_TRACK;
 }
 
+// per slot: the drive type named by the image's SIMH footer ("" if none)
+static char slot_footer[3][17];
+
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+// a valid SIMH footer at the end of the image: its drive type and data size
+static int simh_footer(fileTYPE *f, char *drv, uint64_t *data)
+{
+	uint8_t b[512];
+	if ((uint64_t)f->size <= sizeof(b)) return 0;
+	__off64_t keep = f->offset;
+	int ok = FileSeek(f, f->size - sizeof(b), SEEK_SET) && FileReadAdv(f, b, sizeof(b)) == (int)sizeof(b);
+	FileSeek(f, keep, SEEK_SET);
+	if (!ok || memcmp(b, "simh", 4) || be32(b + 508) != (uint32_t)mz_crc32(MZ_CRC32_INIT, b, 508)) return 0;
+	uint64_t n = (uint64_t)be32(b + 84) * be32(b + 88);            // sector size x sector count
+	if (!n || n > (uint64_t)f->size - sizeof(b)) return 0;
+	memcpy(drv, b + 68, 16); drv[16] = 0;
+	*data = n;
+	return 1;
+}
+
 // choose the drive for an RL or RH image from the extent of its pack
 static void choose_drive(int slot, fileTYPE *f)
 {
 	char fsname[64] = "";
-	uint64_t fs = pdp2011_fs_size(f, fsname, sizeof(fsname));
-	uint64_t ext = fs ? fs : (uint64_t)f->size;
 	const char *drv = "?";
 	slot_nominal[slot] = 0;
+	if (slot_footer[slot][0])                                    // SIMH says which drive: that is it
+	{
+		const char *n = slot_footer[slot];
+		if (slot == 1 && (!strcmp(n, "RL01") || !strcmp(n, "RL02")))
+			slot_nominal[1] = strcmp(n, "RL01") ? RL02_SIZE : RL01_SIZE;
+		if (slot == 2)
+		{
+			if (!strcmp(n, "RP05")) n = "RP04";                     // the same geometry
+			for (unsigned i = 0; i < sizeof(rh_drives) / sizeof(rh_drives[0]); i++)
+				if (!strcmp(n, rh_drives[i].name)) slot_nominal[2] = rh_drives[i].size;
+		}
+		if (slot_nominal[slot])
+		{
+			printf("PDP2011 disk slot %d: %s, SIMH footer: %s -> %s\n", slot, f->name, slot_footer[slot], n);
+			return;
+		}
+		printf("PDP2011 disk slot %d: %s, SIMH footer names %s, not a drive of this controller\n", slot, f->name, slot_footer[slot]);
+	}
+	uint64_t fs = pdp2011_fs_size(f, fsname, sizeof(fsname));
+	uint64_t ext = fs ? fs : (uint64_t)f->size;
 	if (slot == 1)
 	{
 		slot_nominal[1] = ext <= RL01_SIZE ? RL01_SIZE : RL02_SIZE;
@@ -137,6 +183,14 @@ void pdp2011_disk_mounted(int slot, fileTYPE *f)
 	if (slot < 0 || slot > 2) return;
 	bbt_state[slot] = -1;
 	slot_nominal[slot] = 0;
+	slot_footer[slot][0] = 0;
+	uint64_t data;
+	if (f && f->size && simh_footer(f, slot_footer[slot], &data))
+	{
+		printf("PDP2011 disk slot %d: %s has a SIMH footer (%s, %llu data bytes): hidden\n", slot, f->name,
+			slot_footer[slot], (unsigned long long)data);
+		f->size = data;                                          // the pack ends where the footer begins
+	}
 	if ((slot == 1 || slot == 2) && f && f->size) choose_drive(slot, f);
 	if (slot == 1 && f && f->size)
 	{
