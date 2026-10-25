@@ -15,10 +15,20 @@
 //    177777 to the end of each 256-byte sector. Nothing is written for it,
 //    and -- the user's rule -- a write that lands only in that area does not
 //    grow a short image. Any real data there is the OS's and passes through.
+//
+// 3. The drive behind an RL or RH image. The extent of the pack -- its file
+//    system's (fssize.cpp: RSTS/E, RT-11, ODS-1, as SIMH's autosize), else the
+//    file's size -- picks the drive: with a file system the smallest that holds
+//    it (RL01 or RL02; RM03, RP04, RM80, RP06, RM05 or RP07), without one an RH
+//    drive whose size the file is close to (1 MB short to 64 KB long), else an
+//    RP06 as before. The core is told that drive's nominal
+//    size instead of the file size (pdp2011_disk_report_size) and sets the
+//    drive type from it; growing a short image stops at the same size.
 
 #include <stdio.h>
 #include <string.h>
 #include "diskcompat.h"
+#include "fssize.h"
 
 #define RK05_SIZE  2494464ULL       // 203 cyl * 2 surfaces * 12 * 512
 #define RL01_SIZE  5242880ULL       // 256 cyl * 2 * 40 * 256
@@ -30,8 +40,26 @@
 // per slot: -1 unknown, 0 the image has data in the table area, 1 serve the empty table
 static int bbt_state[3] = { -1, -1, -1 };
 
+// RH drives in order of capacity: rh11's rh_type, cylinders x tracks x sectors x 512
+static const struct { const char *name; uint64_t size; } rh_drives[] = {
+	{ "RM03",  67420160ULL },     // 823 x  5 x 32
+	{ "RP04",  87960576ULL },     // 411 x 19 x 22
+	{ "RM80", 124214272ULL },     // 559 x 14 x 31
+	{ "RP06", RP06_SIZE },        // 815 x 19 x 22
+	{ "RM05", 256196608ULL },     // 823 x 19 x 32
+	{ "RP07", 516096000ULL },     // 630 x 32 x 50
+};
+
+// without a file system, an image this much shorter or longer than a drive is taken for it
+#define RH_SHORT (1024 * 1024ULL)
+#define RH_LONG  (64 * 1024ULL)
+
+// per slot: the nominal size of the drive chosen at mount (0: not chosen yet)
+static uint64_t slot_nominal[3];
+
 static uint64_t nominal(int slot, uint64_t size)
 {
+	if (slot >= 0 && slot <= 2 && slot_nominal[slot]) return slot_nominal[slot];
 	switch (slot)
 	{
 	case 0: return RK05_SIZE;
@@ -44,6 +72,48 @@ static uint64_t nominal(int slot, uint64_t size)
 static uint64_t bbt_start(fileTYPE *f)
 {
 	return nominal(1, f->size) - RL_TRACK;
+}
+
+// choose the drive for an RL or RH image from the extent of its pack
+static void choose_drive(int slot, fileTYPE *f)
+{
+	char fsname[64] = "";
+	uint64_t fs = pdp2011_fs_size(f, fsname, sizeof(fsname));
+	uint64_t ext = fs ? fs : (uint64_t)f->size;
+	const char *drv = "?";
+	slot_nominal[slot] = 0;
+	if (slot == 1)
+	{
+		slot_nominal[1] = ext <= RL01_SIZE ? RL01_SIZE : RL02_SIZE;
+		drv = ext <= RL01_SIZE ? "RL01" : "RL02";
+	}
+	else if (slot == 2)
+	{
+		const unsigned n = sizeof(rh_drives) / sizeof(rh_drives[0]);
+		if (fs)                                                  // a file system: the smallest drive that holds it
+		{
+			for (unsigned i = 0; i < n; i++)
+				if (ext <= rh_drives[i].size) { slot_nominal[2] = rh_drives[i].size; drv = rh_drives[i].name; break; }
+		}
+		else                                                     // only the file size: a drive it is close to
+		{                                                        // (images are often a little short or long)
+			for (unsigned i = 0; i < n; i++)
+				if (ext + RH_SHORT >= rh_drives[i].size && ext <= rh_drives[i].size + RH_LONG)
+					{ slot_nominal[2] = rh_drives[i].size; drv = rh_drives[i].name; break; }
+		}
+		if (!slot_nominal[2]) { slot_nominal[2] = RP06_SIZE; drv = "RP06 (default)"; }
+	}
+	else return;
+	if (fs) printf("PDP2011 disk slot %d: %s, %llu bytes; %s, %llu blocks -> %s\n", slot, f->name,
+		(unsigned long long)f->size, fsname, (unsigned long long)(fs / 512), drv);
+	else printf("PDP2011 disk slot %d: %s, %llu bytes; no file system recognised -> %s\n", slot, f->name,
+		(unsigned long long)f->size, drv);
+}
+
+uint64_t pdp2011_disk_report_size(int slot, fileTYPE *f)
+{
+	if (slot < 1 || slot > 2 || !f || !f->size || !slot_nominal[slot]) return f ? (uint64_t)f->size : 0;
+	return slot_nominal[slot];
 }
 
 static int bbt_empty(fileTYPE *f)
@@ -66,6 +136,8 @@ void pdp2011_disk_mounted(int slot, fileTYPE *f)
 {
 	if (slot < 0 || slot > 2) return;
 	bbt_state[slot] = -1;
+	slot_nominal[slot] = 0;
+	if ((slot == 1 || slot == 2) && f && f->size) choose_drive(slot, f);
 	if (slot == 1 && f && f->size)
 	{
 		bbt_state[1] = bbt_empty(f);

@@ -2295,6 +2295,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 	spi8(UIO_SET_SDINFO);
 
 	__off64_t size = sd_image[index].size;
+	if (is_pdp2011() && ret && index <= 2) size = pdp2011_disk_report_size(index, &sd_image[index]);   // the chosen drive's size
 	if (!ret && pre)
 	{
 		sd_image[index].type = 2;
