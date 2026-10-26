@@ -47,6 +47,7 @@
 #include "support/pdp2011/tapeconv.h"
 #include "support/pdp2011/tu58.h"
 #include "support/pdp2011/diskcompat.h"
+#include "support/pdp2011/devinf.h"
 
 static char core_path[1024] = {};
 static char rbf_path[1024] = {};
@@ -2129,6 +2130,23 @@ void user_io_file_info(const char *ext)
 	DisableFpga();
 }
 
+// PDP2011: tell the core which RK/RL units are present and which are read-only (dev_units.sv, UIO 0x5C).
+// word 1: RL present[3:0] / ro[7:4]; word 2: RK present[7:0] / ro[15:8].
+static void pdp2011_send_units()
+{
+	if (!is_pdp2011()) return;
+	uint8_t rlp, rlr, rkp, rkr;
+	pdp2011_dev_bits(1, &rlp, &rlr);   // RL = slot 1
+	pdp2011_dev_bits(0, &rkp, &rkr);   // RK = slot 0
+	uint16_t rl_word = (uint16_t)((rlp & 0x0F) | ((rlr & 0x0F) << 4));
+	uint16_t rk_word = (uint16_t)(rkp | (rkr << 8));
+	spi_uio_cmd_cont(0x5C);
+	spi_w(rl_word);
+	spi_w(rk_word);
+	DisableIO();
+	printf("PDP2011 units: RL present %x ro %x; RK present %02x ro %02x\n", rlp & 0xF, rlr & 0xF, rkp, rkr);
+}
+
 int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_size)
 {
 	int writable = 0;
@@ -2180,8 +2198,29 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 				}
 
 				writable = pdp2011_tape_streaming(index) ? 0 : FileCanWrite(name);
-				ret = FileOpenEx(&sd_image[index], name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
+				// PDP2011 .inf device manifest (RL slot): unit 0 is the image named for unit 0; units
+				// 1-3 are served by support/pdp2011/devinf.cpp. Opening unit 0 here keeps size/type
+				// (its SIMH footer) working as for a plain .dsk.
+				const char *openname = name;
+				char inf_u0[1024];
+				int inf_u0_ro = 0;
+				size_t nl = strlen(name);
+				int is_inf = is_pdp2011() && (index == 0 || index == 1) && nl > 4 && !strcasecmp(name + nl - 4, ".inf");
+				if (is_inf && !pdp2011_inf_unit0(name, inf_u0, sizeof(inf_u0), &inf_u0_ro))
+				{
+					printf("PDP2011 .inf %s: no unit 0 named\n", name); is_inf = 0;
+				}
+				else if (is_inf) openname = inf_u0;
+				int open_w = writable && !(is_inf && inf_u0_ro);   // a unit-0 "ro" flag protects the pack
+				ret = FileOpenEx(&sd_image[index], openname, open_w ? (O_RDWR | O_SYNC) : O_RDONLY);
 				if (is_pdp2011() && index <= 2) pdp2011_disk_mounted(index, ret ? &sd_image[index] : NULL);
+				if (is_pdp2011() && (index == 0 || index == 1))
+				{
+					uint32_t stride = index == 1 ? 20480 : 6144;   // RL02 / RK05 per-unit extent (blocks)
+					if (is_inf && ret) pdp2011_inf_mount(index, name, stride, writable);
+					else { pdp2011_inf_unmount(index); pdp2011_dev_plain(index, ret ? 1 : 0, writable); }
+					pdp2011_send_units();
+				}
 				if (pdp2011_tape_streaming(index))
 				{
 					if (!ret) pdp2011_tape_detach(index);
@@ -3428,6 +3467,14 @@ void user_io_poll()
 						printf("Error in creating file: %s\n", sd_image[disk].path);
 					}
 				}
+				else if (is_pdp2011() && pdp2011_inf_active(disk) && pdp2011_inf_unit(disk, lba) >= 1)
+				{
+					// PDP2011 .inf: write to a unit>=1 image (devinf.cpp)
+					diskled_on();
+					int unit = pdp2011_inf_unit(disk, lba);
+					uint64_t off = (lba % pdp2011_inf_stride(disk)) * (uint64_t)blksz;
+					pdp2011_inf_write(disk, unit, off, buffer[disk], sz);
+				}
 				else if (is_pdp2011() && disk <= 2 &&
 					pdp2011_disk_write(disk, &sd_image[disk], lba * blksz, buffer[disk], sz))
 				{
@@ -3496,6 +3543,15 @@ void user_io_poll()
 						// PDP2011: TPC/E11 tape assembled into SIMH blocks on the fly
 						diskled_on();
 						done = pdp2011_tape_read(disk, lba * blksz, (uint8_t *)buffer[disk], sizeof(buffer[disk]));
+						if (done) buffer_lba[disk] = lba;
+					}
+					else if (is_pdp2011() && pdp2011_inf_active(disk) && pdp2011_inf_unit(disk, lba) >= 1)
+					{
+						// PDP2011 .inf: unit 0 is sd_image (below); units 1-3 come from devinf.cpp
+						diskled_on();
+						int unit = pdp2011_inf_unit(disk, lba);
+						uint64_t off = (lba % pdp2011_inf_stride(disk)) * (uint64_t)blksz;
+						done = pdp2011_inf_read(disk, unit, off, (uint8_t *)buffer[disk], sizeof(buffer[disk]));
 						if (done) buffer_lba[disk] = lba;
 					}
 					else if (sd_image[disk].size)
