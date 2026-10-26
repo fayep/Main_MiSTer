@@ -8,7 +8,11 @@
 //
 //     ; RL units
 //     0 = RSTS/V7.0/nk_boot.dsk
-//     2 = RSTS/V7.0/nk_system.dsk
+//     2 = RSTS/V7.0/nk_system.dsk ro      ; a trailing "ro" protects the image from writes
+//
+// The same image may be named for more than one unit (one pack aliased to its boot and system
+// units); mark it "ro" on units the guest only reads, so an alias is never written through two
+// handles. "ro" works for unit 0 (opened read-only) and units 1-3 (writes dropped).
 //
 // Paths are relative to the manifest's own directory (or absolute). Unit 0 is handled by the
 // normal sd_image[slot] path (so its SIMH footer still gives the drive type and size); this
@@ -30,6 +34,7 @@ static uint32_t slot_stride[NSLOT];
 // units 1-3 (unit 0 is the normal sd_image[slot]); open file or size 0 if absent
 static fileTYPE unit_file[NSLOT][NUNIT];
 static int unit_open[NSLOT][NUNIT];
+static int unit_ro[NSLOT][NUNIT];        // unit mounted read-only (.inf "ro"): drop writes
 
 int pdp2011_inf_active(int slot)
 {
@@ -48,7 +53,7 @@ void pdp2011_inf_unmount(int slot)
 {
 	if (slot < 0 || slot >= NSLOT) return;
 	for (int u = 1; u < NUNIT; u++)
-		if (unit_open[slot][u]) { FileClose(&unit_file[slot][u]); unit_open[slot][u] = 0; }
+		if (unit_open[slot][u]) { FileClose(&unit_file[slot][u]); unit_open[slot][u] = 0; unit_ro[slot][u] = 0; }
 	slot_stride[slot] = 0;
 }
 
@@ -59,10 +64,11 @@ static void dirof(const char *path, char *dir, size_t n)
 	if (s) s[1] = 0; else dir[0] = 0;
 }
 
-// read the manifest; fill units[0..3] with resolved paths ("" if not named). Returns unit count.
-static int parse_inf(const char *inf_path, char units[NUNIT][1024])
+// read the manifest; fill units[0..3] with resolved paths ("" if not named) and ro[0..3] with
+// the read-only flag (a trailing "ro" / "readonly" token after the path). Returns unit count.
+static int parse_inf(const char *inf_path, char units[NUNIT][1024], int ro[NUNIT])
 {
-	for (int u = 0; u < NUNIT; u++) units[u][0] = 0;
+	for (int u = 0; u < NUNIT; u++) { units[u][0] = 0; ro[u] = 0; }
 	char dir[1024]; dirof(inf_path, dir, sizeof(dir));
 	FILE *f = fopen(getFullPath(inf_path), "r");
 	if (!f) { printf("PDP2011 .inf: cannot open %s\n", inf_path); return 0; }
@@ -81,6 +87,15 @@ static int parse_inf(const char *inf_path, char units[NUNIT][1024])
 		char *e = v + strlen(v);
 		while (e > v && isspace((unsigned char)e[-1])) *--e = 0;  // trim trailing ws/newline
 		if (!*v) continue;
+		// optional trailing "ro"/"readonly" token (whitespace-separated after the path)
+		char *sp = strrchr(v, ' ');
+		if (!sp) sp = strrchr(v, '\t');
+		if (sp && (!strcasecmp(sp + 1, "ro") || !strcasecmp(sp + 1, "readonly")))
+		{
+			ro[unit] = 1;
+			while (sp > v && isspace((unsigned char)sp[-1])) sp--;
+			*sp = 0;                                             // path is everything before the flag
+		}
 		if (v[0] == '/') snprintf(units[unit], 1024, "%s", v);   // absolute
 		else snprintf(units[unit], 1024, "%s%s", dir, v);        // relative to the manifest
 		n++;
@@ -89,31 +104,36 @@ static int parse_inf(const char *inf_path, char units[NUNIT][1024])
 	return n;
 }
 
-// resolve unit 0's image path for the normal mount; returns 0 if the manifest names no unit 0
-int pdp2011_inf_unit0(const char *inf_path, char *out, size_t n)
+// resolve unit 0's image path for the normal mount; returns 0 if the manifest names no unit 0.
+// *ro (if non-NULL) gets unit 0's read-only flag, so the caller opens sd_image accordingly.
+int pdp2011_inf_unit0(const char *inf_path, char *out, size_t n, int *ro)
 {
-	char units[NUNIT][1024];
-	if (!parse_inf(inf_path, units) || !units[0][0]) return 0;
+	char units[NUNIT][1024]; int r[NUNIT];
+	if (!parse_inf(inf_path, units, r) || !units[0][0]) return 0;
 	snprintf(out, n, "%s", units[0]);
+	if (ro) *ro = r[0];
 	return 1;
 }
 
 // set up a slot from its manifest: open units 1-3, remember the stride. Call after unit 0 mounts.
+// writable is the slot's overall writability; a unit's "ro" flag forces it read-only regardless.
 void pdp2011_inf_mount(int slot, const char *inf_path, uint32_t stride_blocks, int writable)
 {
 	pdp2011_inf_unmount(slot);
 	if (slot < 0 || slot >= NSLOT) return;
-	char units[NUNIT][1024];
-	parse_inf(inf_path, units);
+	char units[NUNIT][1024]; int ro[NUNIT];
+	parse_inf(inf_path, units, ro);
 	slot_stride[slot] = stride_blocks;
 	for (int u = 1; u < NUNIT; u++)
 	{
 		if (!units[u][0]) continue;
-		if (FileOpenEx(&unit_file[slot][u], units[u], writable ? (O_RDWR | O_SYNC) : O_RDONLY))
+		int w = writable && !ro[u];
+		if (FileOpenEx(&unit_file[slot][u], units[u], w ? (O_RDWR | O_SYNC) : O_RDONLY))
 		{
 			unit_open[slot][u] = 1;
-			printf("PDP2011 .inf slot %d unit %d: %s (%llu bytes)\n", slot, u, units[u],
-				(unsigned long long)unit_file[slot][u].size);
+			unit_ro[slot][u] = !w;
+			printf("PDP2011 .inf slot %d unit %d: %s (%llu bytes)%s\n", slot, u, units[u],
+				(unsigned long long)unit_file[slot][u].size, unit_ro[slot][u] ? " read-only" : "");
 		}
 		else printf("PDP2011 .inf slot %d unit %d: cannot open %s\n", slot, u, units[u]);
 	}
@@ -133,6 +153,7 @@ int pdp2011_inf_read(int slot, int unit, uint64_t off_in_unit, uint8_t *buf, uin
 int pdp2011_inf_write(int slot, int unit, uint64_t off_in_unit, const uint8_t *buf, uint32_t len)
 {
 	if (slot < 0 || slot >= NSLOT || unit < 1 || unit >= NUNIT || !unit_open[slot][unit]) return 1;
+	if (unit_ro[slot][unit]) return 1;                           // read-only: drop the write
 	fileTYPE *f = &unit_file[slot][unit];
 	if (off_in_unit >= (uint64_t)f->size) return 1;              // past this pack: drop
 	if (FileSeek(f, off_in_unit, SEEK_SET)) FileWriteAdv(f, (void *)buf, len);

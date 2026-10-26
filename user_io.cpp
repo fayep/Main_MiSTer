@@ -2186,14 +2186,16 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 				// (its SIMH footer) working as for a plain .dsk.
 				const char *openname = name;
 				char inf_u0[1024];
+				int inf_u0_ro = 0;
 				size_t nl = strlen(name);
 				int is_inf = is_pdp2011() && index == 1 && nl > 4 && !strcasecmp(name + nl - 4, ".inf");
-				if (is_inf && !pdp2011_inf_unit0(name, inf_u0, sizeof(inf_u0)))
+				if (is_inf && !pdp2011_inf_unit0(name, inf_u0, sizeof(inf_u0), &inf_u0_ro))
 				{
 					printf("PDP2011 .inf %s: no unit 0 named\n", name); is_inf = 0;
 				}
 				else if (is_inf) openname = inf_u0;
-				ret = FileOpenEx(&sd_image[index], openname, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
+				int open_w = writable && !(is_inf && inf_u0_ro);   // a unit-0 "ro" flag protects the pack
+				ret = FileOpenEx(&sd_image[index], openname, open_w ? (O_RDWR | O_SYNC) : O_RDONLY);
 				if (is_pdp2011() && index <= 2) pdp2011_disk_mounted(index, ret ? &sd_image[index] : NULL);
 				if (is_pdp2011() && index == 1) { if (is_inf && ret) pdp2011_inf_mount(1, name, 20480, writable); else pdp2011_inf_unmount(1); }
 				if (pdp2011_tape_streaming(index))
