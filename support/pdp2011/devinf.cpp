@@ -27,7 +27,7 @@
 #include "../../file_io.h"
 
 #define NSLOT 3          // disk slots 0 (RK), 1 (RL), 2 (RH)
-#define NUNIT 4          // units 0-3 per controller
+#define NUNIT 8          // up to 8 units per controller (RK05); RL uses 0-3
 
 // per-slot unit stride in 512-byte blocks (unit N starts at N*stride); 0 = no .inf / no routing
 static uint32_t slot_stride[NSLOT];
@@ -35,6 +35,8 @@ static uint32_t slot_stride[NSLOT];
 static fileTYPE unit_file[NSLOT][NUNIT];
 static int unit_open[NSLOT][NUNIT];
 static int unit_ro[NSLOT][NUNIT];        // unit mounted read-only (.inf "ro"): drop writes
+static uint8_t slot_present[NSLOT];      // bit u: a unit u image is mounted (for the core's UIO word)
+static uint8_t slot_romask[NSLOT];       // bit u: unit u is read-only
 
 int pdp2011_inf_active(int slot)
 {
@@ -55,6 +57,8 @@ void pdp2011_inf_unmount(int slot)
 	for (int u = 1; u < NUNIT; u++)
 		if (unit_open[slot][u]) { FileClose(&unit_file[slot][u]); unit_open[slot][u] = 0; unit_ro[slot][u] = 0; }
 	slot_stride[slot] = 0;
+	slot_present[slot] = 0;
+	slot_romask[slot] = 0;
 }
 
 static void dirof(const char *path, char *dir, size_t n)
@@ -124,6 +128,8 @@ void pdp2011_inf_mount(int slot, const char *inf_path, uint32_t stride_blocks, i
 	char units[NUNIT][1024]; int ro[NUNIT];
 	parse_inf(inf_path, units, ro);
 	slot_stride[slot] = stride_blocks;
+	slot_present[slot] = 0; slot_romask[slot] = 0;
+	for (int u = 0; u < NUNIT; u++) if (units[u][0]) { slot_present[slot] |= 1 << u; if (ro[u]) slot_romask[slot] |= 1 << u; }
 	for (int u = 1; u < NUNIT; u++)
 	{
 		if (!units[u][0]) continue;
@@ -163,4 +169,21 @@ int pdp2011_inf_write(int slot, int unit, uint64_t off_in_unit, const uint8_t *b
 uint32_t pdp2011_inf_stride(int slot)
 {
 	return pdp2011_inf_active(slot) ? slot_stride[slot] : 0;
+}
+
+// a plain single .dsk (no .inf) is one pack: unit 0 present, the rest absent; unit 0 write-protected
+// iff the mount is not writable.
+void pdp2011_dev_plain(int slot, int present, int writable)
+{
+	if (slot < 0 || slot >= NSLOT) return;
+	slot_present[slot] = present ? 1 : 0;
+	slot_romask[slot] = (present && !writable) ? 1 : 0;
+}
+
+// per-slot present/read-only bitmasks for the UIO word (bit u = unit u)
+void pdp2011_dev_bits(int slot, uint8_t *present, uint8_t *ro)
+{
+	if (slot < 0 || slot >= NSLOT) { if (present) *present = 0; if (ro) *ro = 0; return; }
+	if (present) *present = slot_present[slot];
+	if (ro) *ro = slot_romask[slot];
 }

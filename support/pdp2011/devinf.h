@@ -20,3 +20,8 @@ void pdp2011_inf_unmount(int slot);
 // serve a unit>=1 read/write (offset is bytes within that unit's pack); always handled (1)
 int pdp2011_inf_read(int slot, int unit, uint64_t off_in_unit, uint8_t *buf, uint32_t len);
 int pdp2011_inf_write(int slot, int unit, uint64_t off_in_unit, const uint8_t *buf, uint32_t len);
+
+// a plain single .dsk (no .inf): unit 0 present, read-only iff not writable
+void pdp2011_dev_plain(int slot, int present, int writable);
+// per-slot present / read-only unit bitmasks (bit u = unit u) for the core UIO word
+void pdp2011_dev_bits(int slot, uint8_t *present, uint8_t *ro);

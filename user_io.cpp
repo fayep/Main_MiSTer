@@ -2130,6 +2130,23 @@ void user_io_file_info(const char *ext)
 	DisableFpga();
 }
 
+// PDP2011: tell the core which RK/RL units are present and which are read-only (dev_units.sv, UIO 0x5C).
+// word 1: RL present[3:0] / ro[7:4]; word 2: RK present[7:0] / ro[15:8].
+static void pdp2011_send_units()
+{
+	if (!is_pdp2011()) return;
+	uint8_t rlp, rlr, rkp, rkr;
+	pdp2011_dev_bits(1, &rlp, &rlr);   // RL = slot 1
+	pdp2011_dev_bits(0, &rkp, &rkr);   // RK = slot 0
+	uint16_t rl_word = (uint16_t)((rlp & 0x0F) | ((rlr & 0x0F) << 4));
+	uint16_t rk_word = (uint16_t)(rkp | (rkr << 8));
+	spi_uio_cmd_cont(0x5C);
+	spi_w(rl_word);
+	spi_w(rk_word);
+	DisableIO();
+	printf("PDP2011 units: RL present %x ro %x; RK present %02x ro %02x\n", rlp & 0xF, rlr & 0xF, rkp, rkr);
+}
+
 int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_size)
 {
 	int writable = 0;
@@ -2188,7 +2205,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 				char inf_u0[1024];
 				int inf_u0_ro = 0;
 				size_t nl = strlen(name);
-				int is_inf = is_pdp2011() && index == 1 && nl > 4 && !strcasecmp(name + nl - 4, ".inf");
+				int is_inf = is_pdp2011() && (index == 0 || index == 1) && nl > 4 && !strcasecmp(name + nl - 4, ".inf");
 				if (is_inf && !pdp2011_inf_unit0(name, inf_u0, sizeof(inf_u0), &inf_u0_ro))
 				{
 					printf("PDP2011 .inf %s: no unit 0 named\n", name); is_inf = 0;
@@ -2197,7 +2214,13 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 				int open_w = writable && !(is_inf && inf_u0_ro);   // a unit-0 "ro" flag protects the pack
 				ret = FileOpenEx(&sd_image[index], openname, open_w ? (O_RDWR | O_SYNC) : O_RDONLY);
 				if (is_pdp2011() && index <= 2) pdp2011_disk_mounted(index, ret ? &sd_image[index] : NULL);
-				if (is_pdp2011() && index == 1) { if (is_inf && ret) pdp2011_inf_mount(1, name, 20480, writable); else pdp2011_inf_unmount(1); }
+				if (is_pdp2011() && (index == 0 || index == 1))
+				{
+					uint32_t stride = index == 1 ? 20480 : 6144;   // RL02 / RK05 per-unit extent (blocks)
+					if (is_inf && ret) pdp2011_inf_mount(index, name, stride, writable);
+					else { pdp2011_inf_unmount(index); pdp2011_dev_plain(index, ret ? 1 : 0, writable); }
+					pdp2011_send_units();
+				}
 				if (pdp2011_tape_streaming(index))
 				{
 					if (!ret) pdp2011_tape_detach(index);
